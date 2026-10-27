@@ -1,0 +1,32 @@
+[
+  {
+    "cycle": 1,
+    "frame_received": 141,
+    "cancelled_during_next_capture": true,
+    "worker_stopped": true,
+    "events": [
+      "identity",
+      "stopped"
+    ]
+  },
+  {
+    "cycle": 2,
+    "frame_received": 143,
+    "cancelled_during_next_capture": true,
+    "worker_stopped": true,
+    "events": [
+      "identity",
+      "stopped"
+    ]
+  },
+  {
+    "cycle": 3,
+    "frame_received": 145,
+    "cancelled_during_next_capture": true,
+    "worker_stopped": true,
+    "events": [
+      "identity",
+      "stopped"
+    ]
+  }
+]

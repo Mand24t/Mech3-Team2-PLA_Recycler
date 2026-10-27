@@ -1,0 +1,5 @@
+{
+  "checked_at_utc": "2026-10-27T02:50:31.568751+00:00",
+  "port": "COM6",
+  "error": "USB port opened, but no compatible camera firmware replied. The OV7670 sensor itself is not a USB camera; the Nano needs the capture sketch."
+}

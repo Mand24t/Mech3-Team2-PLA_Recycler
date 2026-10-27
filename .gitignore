@@ -1,0 +1,6 @@
+.venv-camera/
+__pycache__/
+*.py[cod]
+*.log
+OV7670Camera/.build-nano/
+OV7670Camera/validation/launcher_check/
