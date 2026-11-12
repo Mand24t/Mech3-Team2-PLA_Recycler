@@ -1,227 +1,822 @@
-"""PLA recycler controller - matching RecyclerMega_Latest.ino (Arduino Mega)."""
-import math
-import queue
-import threading
-import time
+
 import tkinter as tk
 from tkinter import ttk, messagebox
 import serial
+from serial.tools import list_ports
+import threading
+import queue
+import time
+import math
 
-# Change to the Arduino Mega COM port from Device Manager or Arduino IDE.
-PORT = "COM5"
+# =========================================
+# RECYCLER PYTHON CONTROL INTERFACE
+# =========================================
+
 BAUD = 115200
-SEND_PERIOD = 0.15
 
-lock = threading.Lock()
-quit_flag = threading.Event()
-notices = queue.Queue()
-values = {
-    "extruder": 0.0, "stepper": 0.0, "fan": 0.0,
-    "ex_on": False, "st_on": False, "fan_on": False,
-    "reverse": False,
-    "servo_mode": 0,   # 0=detach, 1=center, 2=sweep, 3=hold
-    "servo_range": 10.0, "servo_speed": 15.0, "servo_offset": 0.0,
-}
-connected = False
+BG = "#101827"
+PANEL = "#1e293b"
+FG = "#f8fafc"
+MUTED = "#94a3b8"
+BLUE = "#2563eb"
+RED = "#b91c1c"
 
 
-def serial_worker():
-    try:
-        with serial.Serial(PORT, BAUD, timeout=0.2, write_timeout=1.0) as port:
-            time.sleep(2.2)  # Mega typically resets when USB serial opens.
-            if quit_flag.is_set():
-                return
-            notices.put(("connected", f"Connected: {PORT}"))
-            while not quit_flag.is_set():
-                with lock:
-                    v = values.copy()
-                ex = v["extruder"] if v["ex_on"] else 0.0
-                st = v["stepper"] if v["st_on"] else 0.0
-                if v["reverse"]:
-                    st = -st
-                fan = v["fan"] if v["fan_on"] else 0.0
-                command = (f"SET,{ex:.2f},{st:.2f},{fan:.1f},"
-                           f"{v['servo_mode']},{v['servo_range']:.2f},"
-                           f"{v['servo_speed']:.2f},{v['servo_offset']:.2f}\n")
-                port.write(command.encode("ascii"))
-                quit_flag.wait(SEND_PERIOD)
-            try:
-                port.write(b"STOP\n")
-                port.flush()
-            except (serial.SerialException, OSError):
-                pass
-    except (serial.SerialException, OSError) as error:
-        notices.put(("error", str(error)))
+class Recycler:
 
+    def __init__(self, root):
+        self.root = root
 
-root = tk.Tk()
-root.title("PLA Recycler | Mega Control")
-root.geometry("570x780")
-main = ttk.Frame(root, padding=15)
-main.pack(fill="both", expand=True)
-ttk.Label(main, text="PLA RECYCLER CONTROL", font=("Arial", 17, "bold")).pack(anchor="w")
-connection_label = ttk.Label(main, text=f"Connecting to {PORT} ...")
-connection_label.pack(anchor="w", pady=(0, 8))
-status = {}
-start_buttons = []
+        root.title("Recycler | Motor Control")
+        root.geometry("780x850")
+        root.minsize(720, 740)
+        root.configure(bg=BG)
 
+        self.ser = None
+        self.worker = None
 
-def set_enabled(key, enabled):
-    if enabled and not connected:
-        messagebox.showwarning("Not connected", "Connect to the Arduino first.")
-        return
-    with lock:
-        values[key] = enabled
-    status[key].config(text="RUNNING" if enabled else "STOPPED")
+        self.closing = threading.Event()
 
+        self.outgoing = queue.Queue()
+        self.incoming = queue.Queue()
 
-def add_speed(title, key, enable_key, max_value, unit, resolution, reverse=False):
-    frame = ttk.LabelFrame(main, text=title, padding=7)
-    frame.pack(fill="x", pady=5)
-    var = tk.DoubleVar(value=0)
-    show = ttk.Label(frame, text=f"0.0 {unit}")
-    show.pack(anchor="e")
+        self.connected = False
+        self.ready = False
+        self.armed = False
+        self.cl_ready = False
 
-    def changed(value):
-        number = float(value)
-        with lock:
-            values[key] = number
-        show.config(text=f"{number:.1f} {unit}")
+        self.port = tk.StringVar()
 
-    tk.Scale(frame, from_=0, to=max_value, resolution=resolution,
-             orient="horizontal", showvalue=False, length=480,
-             variable=var, command=changed).pack()
-    controls = ttk.Frame(frame)
-    controls.pack(fill="x")
-    entry = ttk.Entry(controls, width=7)
-    entry.insert(0, "0")
-    entry.pack(side="left", padx=(0, 4))
+        self.status = tk.StringVar(
+            value="Disconnected"
+        )
 
-    def apply_entry():
+        self.response = tk.StringVar(
+            value="Connect to Arduino Mega."
+        )
+
+        self.values = {}
+
+        self.make_ui()
+        self.refresh_ports()
+
+        root.after(100, self.poll)
+
+        root.protocol(
+            "WM_DELETE_WINDOW", self.close
+        )
+
+    # =====================================
+    # BUTTON HELPER
+    # =====================================
+
+    def btn(self, parent, label,
+            action, color=BLUE):
+
+        return tk.Button(
+            parent,
+            text=label,
+            command=action,
+            bg=color,
+            fg="white",
+            activebackground=color,
+            activeforeground="white",
+            relief="flat",
+            padx=13,
+            pady=9,
+            font=("Segoe UI", 10, "bold")
+        )
+
+    # =====================================
+    # BUILD INTERFACE
+    # =====================================
+
+    def make_ui(self):
+
+        tk.Label(
+            self.root,
+            text="RECYCLER",
+            bg=BG,
+            fg=FG,
+            font=("Segoe UI", 25, "bold")
+        ).pack(
+            anchor="w",
+            padx=25,
+            pady=(18, 0)
+        )
+
+        tk.Label(
+            self.root,
+            text="Arduino Mega 2560 | RPM Control",
+            bg=BG,
+            fg=MUTED,
+            font=("Segoe UI", 11)
+        ).pack(anchor="w", padx=25)
+
+        # Connection panel
+
+        top = tk.Frame(
+            self.root,
+            bg=PANEL,
+            padx=15,
+            pady=14
+        )
+
+        top.pack(
+            fill="x",
+            padx=25,
+            pady=16
+        )
+
+        line = tk.Frame(top, bg=PANEL)
+        line.pack(fill="x")
+
+        self.ports = ttk.Combobox(
+            line,
+            textvariable=self.port,
+            state="readonly",
+            width=16
+        )
+
+        self.ports.pack(
+            side="left",
+            padx=(0, 8)
+        )
+
+        self.btn(
+            line,
+            "Refresh",
+            self.refresh_ports,
+            "#475569"
+        ).pack(side="left", padx=3)
+
+        self.btn(
+            line,
+            "Connect",
+            self.connect
+        ).pack(side="left", padx=3)
+
+        self.btn(
+            line,
+            "Disconnect",
+            self.disconnect,
+            "#475569"
+        ).pack(side="left", padx=3)
+
+        tk.Label(
+            top,
+            textvariable=self.status,
+            bg=PANEL,
+            fg="#7dd3fc",
+            font=("Segoe UI", 10, "bold")
+        ).pack(anchor="w", pady=(10, 0))
+
+        # Device grid
+
+        grid = tk.Frame(
+            self.root,
+            bg=BG
+        )
+
+        grid.pack(
+            fill="both",
+            expand=True,
+            padx=20
+        )
+
+        grid.columnconfigure(0, weight=1)
+        grid.columnconfigure(1, weight=1)
+
+        devices = [
+            (
+                "DM556",
+                "Stepper - signed RPM",
+                "DMRPM",
+                -20, 20
+            ),
+            (
+                "CL42T",
+                "Stepper - fault lockout active",
+                "CLRPM",
+                -20, 20
+            ),
+            (
+                "FANS",
+                "PWM output - 0 to 255",
+                "FAN",
+                0, 255
+            ),
+            (
+                "SPARK MAX",
+                "RC command - percent",
+                "SPARK",
+                -100, 100
+            )
+        ]
+
+        for index, device in enumerate(devices):
+
+            name, subtitle, command, lo, hi = device
+
+            card = tk.Frame(
+                grid,
+                bg=PANEL,
+                padx=16,
+                pady=14
+            )
+
+            card.grid(
+                row=index // 2,
+                column=index % 2,
+                sticky="nsew",
+                padx=5,
+                pady=5
+            )
+
+            tk.Label(
+                card,
+                text=name,
+                bg=PANEL,
+                fg=FG,
+                font=("Segoe UI", 14, "bold")
+            ).pack(anchor="w")
+
+            tk.Label(
+                card,
+                text=subtitle,
+                bg=PANEL,
+                fg=MUTED,
+                font=("Segoe UI", 9)
+            ).pack(
+                anchor="w",
+                pady=(3, 12)
+            )
+
+            value = tk.StringVar(value="0")
+            self.values[command] = value
+
+            row = tk.Frame(card, bg=PANEL)
+            row.pack(fill="x")
+
+            tk.Entry(
+                row,
+                textvariable=value,
+                font=("Segoe UI", 17),
+                bg="#334155",
+                fg=FG,
+                insertbackground=FG,
+                relief="flat",
+                width=10
+            ).pack(side="left")
+
+            if command.endswith("RPM"):
+                unit = "RPM"
+            elif command == "FAN":
+                unit = "PWM"
+            else:
+                unit = "%"
+
+            tk.Label(
+                row,
+                text=unit,
+                bg=PANEL,
+                fg=MUTED
+            ).pack(side="left", padx=10)
+
+            tk.Label(
+                card,
+                text=f"Allowed: {lo} to {hi}",
+                bg=PANEL,
+                fg=MUTED,
+                font=("Segoe UI", 9)
+            ).pack(
+                anchor="w",
+                pady=(8, 5)
+            )
+
+            button = self.btn(
+                card,
+                "Apply",
+                lambda c=command, a=lo, b=hi:
+                    self.apply(c, a, b)
+            )
+
+            button.pack(fill="x")
+
+            if command == "CLRPM":
+                button.configure(state="disabled")
+                self.cl_button = button
+
+        # D10 servo controls (independent of existing motor cards)
+        servo_card = tk.Frame(
+            self.root, bg=PANEL, padx=16, pady=12
+        )
+        servo_card.pack(fill="x", padx=25, pady=(10, 0))
+
+        tk.Label(
+            servo_card, text="D10 SERVO SWEEP",
+            bg=PANEL, fg=FG,
+            font=("Segoe UI", 14, "bold")
+        ).pack(anchor="w")
+
+        tk.Label(
+            servo_card,
+            text="Center offset, angular speed, +/- sweep range",
+            bg=PANEL, fg=MUTED,
+            font=("Segoe UI", 9)
+        ).pack(anchor="w", pady=(2, 8))
+
+        self.servo_center = tk.StringVar(value="0")
+        self.servo_speed = tk.StringVar(value="30")
+        self.servo_bounds = tk.StringVar(value="45")
+
+        servo_fields = tk.Frame(servo_card, bg=PANEL)
+        servo_fields.pack(fill="x")
+        for col, (label, variable) in enumerate((
+            ("Center (deg)", self.servo_center),
+            ("Speed (deg/s)", self.servo_speed),
+            ("Bounds (+/- deg)", self.servo_bounds)
+        )):
+            field = tk.Frame(servo_fields, bg=PANEL)
+            field.grid(row=0, column=col, padx=(0, 16), sticky="w")
+            tk.Label(
+                field, text=label, bg=PANEL, fg=MUTED,
+                font=("Segoe UI", 9)
+            ).pack(anchor="w")
+            tk.Entry(
+                field, textvariable=variable,
+                font=("Segoe UI", 13), width=12,
+                bg="#334155", fg=FG,
+                insertbackground=FG, relief="flat"
+            ).pack(anchor="w", pady=(3, 0))
+
+        servo_buttons = tk.Frame(servo_card, bg=PANEL)
+        servo_buttons.pack(fill="x", pady=(10, 0))
+        self.btn(
+            servo_buttons, "Start / Apply Sweep", self.apply_servo
+        ).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self.btn(
+            servo_buttons, "Stop Servo", self.stop_servo, "#475569"
+        ).pack(side="left", fill="x", expand=True)
+
+        # Bottom controls
+
+        controls = tk.Frame(
+            self.root,
+            bg=BG
+        )
+
+        controls.pack(
+            fill="x",
+            padx=25,
+            pady=(12, 4)
+        )
+
+        self.btn(
+            controls,
+            "Arm SPARK MAX",
+            self.arm,
+            "#475569"
+        ).pack(side="left")
+
+        self.btn(
+            controls,
+            "Read Status",
+            lambda: self.send("STATUS"),
+            "#475569"
+        ).pack(side="left", padx=8)
+
+        self.btn(
+            self.root,
+            "STOP ALL",
+            self.stop,
+            RED
+        ).pack(
+            fill="x",
+            padx=25,
+            pady=12
+        )
+
+        tk.Label(
+            self.root,
+            textvariable=self.response,
+            bg=BG,
+            fg="#7dd3fc",
+            font=("Consolas", 10),
+            wraplength=730
+        ).pack(
+            padx=25,
+            pady=(0, 16)
+        )
+
+    # =====================================
+    # SERIAL PORTS
+    # =====================================
+
+    def refresh_ports(self):
+
+        ports = [
+            p.device
+            for p in list_ports.comports()
+        ]
+
+        self.ports["values"] = ports
+
+        if ports and self.port.get() not in ports:
+            self.port.set(ports[0])
+
+    # =====================================
+    # CONNECT
+    # =====================================
+
+    def connect(self):
+
+        if self.connected:
+            return
+
+        if not self.port.get():
+            messagebox.showerror(
+                "Port",
+                "Select a COM port."
+            )
+            return
+
         try:
-            speed = float(entry.get())
-            if not math.isfinite(speed) or not 0 <= speed <= max_value:
-                raise ValueError
-            var.set(speed)
-            changed(speed)
+            self.ser = serial.Serial(
+                self.port.get(),
+                BAUD,
+                timeout=0.1,
+                write_timeout=0.5
+            )
+
+        except (serial.SerialException, OSError) as e:
+            messagebox.showerror(
+                "Connection failed",
+                str(e)
+            )
+            return
+
+        self.closing.clear()
+
+        self.connected = True
+        self.ready = False
+        self.armed = False
+
+        self.status.set(
+            "Waiting for Arduino startup..."
+        )
+
+        self.worker = threading.Thread(
+            target=self.serial_worker,
+            daemon=True
+        )
+
+        self.worker.start()
+
+    # =====================================
+    # SERIAL WORKER
+    # =====================================
+
+    def serial_worker(self):
+
+        started = time.monotonic()
+        next_ping = started + 2.5
+
+        partial = bytearray()
+
+        try:
+            while not self.closing.is_set():
+
+                now = time.monotonic()
+
+                if now >= next_ping:
+                    self.outgoing.put("PING")
+                    next_ping = now + 0.5
+
+                try:
+                    command = self.outgoing.get_nowait()
+                except queue.Empty:
+                    command = None
+
+                if command:
+                    self.ser.write(
+                        (command + "\n").encode("ascii")
+                    )
+
+                chunk = self.ser.read(
+                    self.ser.in_waiting or 1
+                )
+
+                if chunk:
+                    partial.extend(chunk)
+
+                    while b"\n" in partial:
+
+                        line, _, rest = partial.partition(
+                            b"\n"
+                        )
+
+                        partial = bytearray(rest)
+
+                        self.incoming.put(
+                            line.decode(
+                                errors="replace"
+                            ).strip()
+                        )
+
+                    if len(partial) > 512:
+                        partial.clear()
+
+        except (serial.SerialException, OSError) as e:
+            self.incoming.put(
+                "CONNECTION_LOST " + str(e)
+            )
+
+        finally:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+
+    # =====================================
+    # SEND COMMAND
+    # =====================================
+
+    def send(self, command):
+
+        if not self.connected or not self.ready:
+            self.response.set(
+                "Arduino not ready."
+            )
+            return False
+
+        self.outgoing.put(command)
+
+        self.response.set(
+            "Sent: " + command
+        )
+
+        return True
+
+    # =====================================
+    # APPLY MOTOR VALUE
+    # =====================================
+
+    def apply(self, command, lo, hi):
+
+        try:
+            value = float(
+                self.values[command].get()
+            )
+
+            if not math.isfinite(value):
+                raise ValueError()
+
+            if not lo <= value <= hi:
+                raise ValueError()
+
+            if command in ("FAN", "SPARK"):
+                if not value.is_integer():
+                    raise ValueError()
+
         except ValueError:
-            messagebox.showerror("Invalid value", f"Enter 0 to {max_value} {unit}.")
+            messagebox.showwarning(
+                "Invalid input",
+                f"Enter a number from {lo} to {hi}."
+            )
+            return
 
-    ttk.Button(controls, text="Set", command=apply_entry).pack(side="left")
-    start = ttk.Button(controls, text="START", command=lambda: set_enabled(enable_key, True))
-    start.pack(side="left", padx=6)
-    start_buttons.append(start)
-    ttk.Button(controls, text="STOP", command=lambda: set_enabled(enable_key, False)).pack(side="left")
-    if reverse:
-        reverse_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(controls, text="Reverse", variable=reverse_var,
-                        command=lambda: update_setting("reverse", reverse_var.get())).pack(side="left", padx=6)
-    status[enable_key] = ttk.Label(controls, text="STOPPED")
-    status[enable_key].pack(side="right")
+        if command == "CLRPM":
+            if not self.cl_ready and value != 0:
+                messagebox.showwarning(
+                    "CL42T fault",
+                    "CL42T is locked out."
+                )
+                return
 
+        if command == "SPARK":
+            if value != 0 and not self.armed:
+                messagebox.showwarning(
+                    "SPARK MAX",
+                    "Arm SPARK MAX first."
+                )
+                return
 
-def update_setting(key, value):
-    with lock:
-        values[key] = value
+        if value.is_integer():
+            number = str(int(value))
+        else:
+            number = str(value)
 
+        self.send(
+            command + " " + number
+        )
 
-add_speed("Extruder screw (125:1, reversed PWM)", "extruder", "ex_on", 40.0, "estimated RPM", 0.1)
-add_speed("CL42T stepper - D30 STEP / D31 DIR", "stepper", "st_on", 60.0, "RPM", 0.5, True)
-add_speed("Cooling fans - DRV8871 D6/D7", "fan", "fan_on", 100.0, "%", 1)
+    # =====================================
+    # D10 SERVO SWEEP
+    # =====================================
 
-servo_frame = ttk.LabelFrame(main, text="HPS-2027 Servo - D10 (unverified; starts detached)", padding=10)
-servo_frame.pack(fill="x", pady=8)
-settings_row = ttk.Frame(servo_frame)
-settings_row.pack(fill="x")
-servo_entries = {}
-for label, key, default in [
-    ("Offset (deg)", "servo_offset", "0"),
-    ("+/- Range (deg)", "servo_range", "10"),
-    ("Speed (deg/s)", "servo_speed", "15"),
-]:
-    cell = ttk.Frame(settings_row)
-    cell.pack(side="left", padx=7)
-    ttk.Label(cell, text=label).pack()
-    entry = ttk.Entry(cell, width=10)
-    entry.insert(0, default)
-    entry.pack()
-    servo_entries[key] = entry
+    def apply_servo(self):
+        try:
+            center = float(self.servo_center.get())
+            speed = float(self.servo_speed.get())
+            bounds = float(self.servo_bounds.get())
+            if not all(math.isfinite(x) for x in (center, speed, bounds)):
+                raise ValueError()
+            if (not -90 <= center <= 90 or
+                    not 0 < speed <= 360 or
+                    not 0 <= bounds <= 90 or
+                    center - bounds < -90 or
+                    center + bounds > 90):
+                raise ValueError()
+        except ValueError:
+            messagebox.showwarning(
+                "Invalid servo settings",
+                "Center must be -90..90, speed >0..360 deg/s, "
+                "bounds 0..90, and center +/- bounds within -90..90."
+            )
+            return
 
+        def fmt(x):
+            return str(int(x)) if x.is_integer() else str(x)
 
-def set_servo(mode):
-    if mode != 0 and not connected:
-        messagebox.showwarning("Not connected", "Connect to the Arduino first.")
-        return
-    try:
-        offset = float(servo_entries["servo_offset"].get())
-        move_range = float(servo_entries["servo_range"].get())
-        speed = float(servo_entries["servo_speed"].get())
-        center = 135 + offset
-        if (not all(math.isfinite(v) for v in (offset, move_range, speed))
-                or not (0 <= move_range <= 125)
-                or not (0 < speed <= 180)
-                or center - move_range < 10 or center + move_range > 260):
-            raise ValueError
-    except ValueError:
-        messagebox.showerror("Servo settings", "Keep 135 + offset +/- range within 10–260 degrees; "
-                             "range 0–125 degrees and speed >0 to 180 degrees/s.")
-        return
-    with lock:
-        values.update(servo_offset=offset, servo_range=move_range,
-                      servo_speed=speed, servo_mode=mode)
-    servo_status.config(text={0: "DETACHED", 1: "CENTER", 2: "SWEEPING", 3: "HOLD"}[mode])
+        self.send("SERVO " + " ".join(fmt(x) for x in (center, speed, bounds)))
 
+    def stop_servo(self):
+        self.send("SERVOSTOP")
 
-servo_controls = ttk.Frame(servo_frame)
-servo_controls.pack(pady=8)
-ttk.Button(servo_controls, text="CENTER", command=lambda: set_servo(1)).pack(side="left", padx=4)
-ttk.Button(servo_controls, text="START SWEEP", command=lambda: set_servo(2)).pack(side="left", padx=4)
-ttk.Button(servo_controls, text="HOLD", command=lambda: set_servo(3)).pack(side="left", padx=4)
-ttk.Button(servo_controls, text="SERVO OFF", command=lambda: set_servo(0)).pack(side="left", padx=4)
-servo_status = ttk.Label(servo_frame, text="DETACHED")
-servo_status.pack()
+    # =====================================
+    # ARM SPARK MAX
+    # =====================================
 
+    def arm(self):
 
-def stop_all():
-    with lock:
-        values["ex_on"] = values["st_on"] = values["fan_on"] = False
-        values["servo_mode"] = 0
-    for label in status.values():
-        label.config(text="STOPPED")
-    servo_status.config(text="DETACHED")
+        confirmed = messagebox.askyesno(
+            "Arm SPARK MAX",
+            "Is the motor area clear, and have "
+            "you verified RC PWM neutral?"
+        )
 
+        if not confirmed:
+            return
 
-tk.Button(main, text="STOP ALL (software command)", bg="#b91c1c", fg="white",
-          font=("Arial", 12, "bold"), command=stop_all).pack(fill="x", pady=9)
-ttk.Label(main, text="Commanded RPM is not measured RPM. A physical E-stop is required.").pack(anchor="w")
+        if self.send("ARM"):
+            self.response.set(
+                "Waiting for Arduino ARM confirmation."
+            )
 
+    # =====================================
+    # STOP ALL
+    # =====================================
 
-def poll():
-    global connected
-    try:
+    def stop(self):
+
+        # Clear pending commands before STOP
         while True:
-            kind, info = notices.get_nowait()
-            if kind == "connected":
-                connected = True
-                connection_label.config(text=info)
-            elif kind == "error":
-                connected = False
-                stop_all()
-                connection_label.config(text=f"CONNECTION ERROR: {info}")
-                messagebox.showerror("Serial connection", info)
-    except queue.Empty:
-        pass
-    if not quit_flag.is_set():
-        root.after(100, poll)
+            try:
+                self.outgoing.get_nowait()
+            except queue.Empty:
+                break
+
+        if self.connected:
+            self.outgoing.put("STOP")
+
+        self.armed = False
+
+        for variable in self.values.values():
+            variable.set("0")
+
+        self.response.set(
+            "STOP requested."
+        )
+
+    # =====================================
+    # PROCESS ARDUINO RESPONSES
+    # =====================================
+
+    def poll(self):
+
+        try:
+            while True:
+
+                line = self.incoming.get_nowait()
+
+                if line in (
+                    "RECYCLER_READY_V2",
+                    "PONG"
+                ):
+                    if not self.ready:
+                        self.ready = True
+                        self.status.set(
+                            "Arduino responding at 115200 baud"
+                        )
+                        self.send("STATUS")
+
+                elif line.startswith("STATUS "):
+
+                    fields = dict(
+                        item.split("=", 1)
+                        for item in line.split()[1:]
+                        if "=" in item
+                    )
+
+                    self.cl_ready = (
+                        fields.get("CL_READY") == "1"
+                    )
+
+                    self.cl_button.configure(
+                        state=(
+                            "normal"
+                            if self.cl_ready
+                            else "disabled"
+                        )
+                    )
+
+                    self.response.set(line)
+
+                elif line == "OK ARM":
+                    self.armed = True
+                    self.response.set(
+                        "SPARK MAX armed in software"
+                    )
+
+                elif line.startswith("ERR"):
+                    self.response.set(line)
+
+                elif line == "WATCHDOG_STOP":
+                    self.armed = False
+                    self.response.set(
+                        "WATCHDOG_STOP"
+                    )
+
+                elif line.startswith("CONNECTION_LOST"):
+                    self.status.set(line)
+                    self.connected = False
+                    self.ready = False
+                    self.armed = False
+
+                elif line and line != "PONG":
+                    self.response.set(line)
+
+        except queue.Empty:
+            pass
+
+        self.root.after(
+            100,
+            self.poll
+        )
+
+    # =====================================
+    # DISCONNECT
+    # =====================================
+
+    def disconnect(self):
+
+        if self.connected:
+            self.stop()
+
+            self.root.after(
+                200,
+                self.finish_disconnect
+            )
+        else:
+            self.finish_disconnect()
+
+    def finish_disconnect(self):
+
+        self.closing.set()
+
+        self.connected = False
+        self.ready = False
+        self.armed = False
+
+        self.status.set("Disconnected")
+
+    # =====================================
+    # CLOSE
+    # =====================================
+
+    def close(self):
+
+        if self.connected:
+            self.stop()
+
+            self.root.after(
+                250,
+                self.close_now
+            )
+        else:
+            self.close_now()
+
+    def close_now(self):
+
+        self.closing.set()
+        self.root.destroy()
 
 
-def on_close():
-    stop_all()
-    quit_flag.set()
-    root.after(300, root.destroy)
+if __name__ == "__main__":
 
+    root = tk.Tk()
 
-root.protocol("WM_DELETE_WINDOW", on_close)
-root.after(100, poll)
-threading.Thread(target=serial_worker, daemon=True).start()
-root.mainloop()
+    Recycler(root)
+
+    root.mainloop()

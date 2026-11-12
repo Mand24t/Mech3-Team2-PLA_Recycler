@@ -5,6 +5,8 @@
 #include "esp_camera.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "hal/gpio_ll.h"
 #include "soc/gpio_struct.h"
 #include "soc/gpio_sig_map.h"
 
@@ -31,15 +33,20 @@ constexpr int CAM_D4 = 21;     // camera D4 -> Nano D10
 constexpr int CAM_D5 = 38;     // camera D5 -> Nano D11
 constexpr int CAM_D6 = 47;     // camera D6 -> Nano D12
 constexpr int CAM_D7 = 48;     // camera D7 -> Nano D13
-// RESET and PWDN were not included in the supplied wiring table.
-// -1 means not driven by the Nano. The module must hold RESET high / PWDN low.
-constexpr int CAM_RESET = -1;
-constexpr int CAM_PWDN = -1;
+// RESET and PWDN use Nano analog-header pins as digital outputs (raw GPIOs).
+constexpr int CAM_RESET = 1;
+constexpr int CAM_PWDN = 14;  // Nano A7; LOW enables the camera.
+constexpr int ILLUMINATION_PIN = 13;  // Nano A6, raw GPIO13; LED has a series resistor.
+// Reserve timer 0 / channel 0 for camera XCLK. Illumination uses its own timer.
+constexpr ledc_timer_t ILLUMINATION_TIMER = LEDC_TIMER_1;
+constexpr ledc_channel_t ILLUMINATION_CHANNEL = LEDC_CHANNEL_2;
+bool illuminationReady = false;
+uint16_t illuminationValue = 255;
 constexpr uint32_t USB_BAUD = 921600;
 constexpr uint32_t XCLK_HZ = 10000000;
 constexpr uint16_t FRAME_WIDTH = 320;
 constexpr uint16_t FRAME_HEIGHT = 240;
-constexpr char FIRMWARE_VERSION[] = "nano-ov7670-usb-1.2";
+constexpr char FIRMWARE_VERSION[] = "nano-ov7670-usb-1.5";
 
 bool cameraAttempted = false;
 bool cameraReady = false;
@@ -60,6 +67,78 @@ struct FrameHeader {
   uint32_t crc32;
 };
 static_assert(sizeof(FrameHeader) == 20, "USB frame header layout changed");
+
+void initializeIllumination() {
+  // Latch HIGH before enabling the output. Input readback permits diagnostics;
+  // all accesses use raw GPIO13, regardless of Arduino's pin-number mode.
+  gpio_set_level(static_cast<gpio_num_t>(ILLUMINATION_PIN), 1);
+  gpio_set_direction(static_cast<gpio_num_t>(ILLUMINATION_PIN), GPIO_MODE_INPUT_OUTPUT);
+  ledc_timer_config_t timer = {};
+  timer.speed_mode = LEDC_LOW_SPEED_MODE;
+  timer.duty_resolution = LEDC_TIMER_8_BIT;
+  timer.timer_num = ILLUMINATION_TIMER;
+  timer.freq_hz = 20000;
+  timer.clk_cfg = LEDC_AUTO_CLK;
+  if (ledc_timer_config(&timer) != ESP_OK) return;
+  ledc_channel_config_t channel = {};
+  channel.gpio_num = ILLUMINATION_PIN;
+  channel.speed_mode = LEDC_LOW_SPEED_MODE;
+  channel.channel = ILLUMINATION_CHANNEL;
+  channel.intr_type = LEDC_INTR_DISABLE;
+  channel.timer_sel = ILLUMINATION_TIMER;
+  channel.duty = 0;
+  if (ledc_channel_config(&channel) == ESP_OK) {
+    // gpio_set_direction would reconnect the plain GPIO output and disconnect
+    // LEDC. Enable only the input buffer so readback preserves PWM routing.
+    gpio_ll_input_enable(&GPIO, static_cast<gpio_num_t>(ILLUMINATION_PIN));
+    // Explicit constant HIGH avoids relying on out-of-range PWM duty 256.
+    illuminationReady = ledc_stop(LEDC_LOW_SPEED_MODE, ILLUMINATION_CHANNEL, 1) == ESP_OK;
+  }
+}
+
+void setIllumination(const char *argument) {
+  char *end;
+  long value = strtol(argument, &end, 10);
+  if (end == argument || *end != '\0' || value < 0 || value > 255) {
+    Serial.println("OV7670_ERROR LED brightness must be an integer from 0 to 255");
+    return;
+  }
+  if (!illuminationReady) {
+    Serial.println("OV7670_ERROR Illumination PWM unavailable");
+    return;
+  }
+  esp_err_t result;
+  if (value == 0 || value == 255) {
+    // Force static LOW/HIGH at the slider endpoints. Intermediate values
+    // re-enable PWM using ledc_update_duty, without changing camera XCLK.
+    result = ledc_stop(LEDC_LOW_SPEED_MODE, ILLUMINATION_CHANNEL, value == 255 ? 1 : 0);
+  } else {
+    result = ledc_set_duty(LEDC_LOW_SPEED_MODE, ILLUMINATION_CHANNEL, static_cast<uint32_t>(value));
+    if (result == ESP_OK) result = ledc_update_duty(LEDC_LOW_SPEED_MODE, ILLUMINATION_CHANNEL);
+  }
+  if (result != ESP_OK) {
+    Serial.println("OV7670_ERROR Could not update illumination PWM");
+    return;
+  }
+  illuminationValue = static_cast<uint16_t>(value);
+  Serial.printf("OV7670_LED {\"value\":%u}\n", illuminationValue);
+}
+
+void sendIlluminationStatus() {
+  uint32_t high = 0;
+  uint32_t started = micros();
+  constexpr uint32_t samples = 2000;
+  for (uint32_t i = 0; i < samples; ++i) {
+    high += gpio_get_level(static_cast<gpio_num_t>(ILLUMINATION_PIN)) != 0;
+    delayMicroseconds(1);
+  }
+  Serial.printf("OV7670_DIAG {\"led_gpio\":%d,\"led_value\":%u,\"led_ready\":%s,"
+                "\"high_samples\":%lu,\"samples\":%lu,\"sample_us\":%lu,\"pwm_hz\":%lu}\n",
+                ILLUMINATION_PIN, illuminationValue, illuminationReady ? "true" : "false",
+                static_cast<unsigned long>(high), static_cast<unsigned long>(samples),
+                static_cast<unsigned long>(micros() - started),
+                static_cast<unsigned long>(ledc_get_freq(LEDC_LOW_SPEED_MODE, ILLUMINATION_TIMER)));
+}
 
 void initializeCamera() {
   if (cameraAttempted) return;
@@ -188,11 +267,12 @@ void sendIdentity() {
     "\"chip\":\"%s\",\"chip_revision\":%u,\"sensor\":\"%s\",\"sensor_pid\":%u,"
     "\"sensor_ver\":%u,\"sensor_midh\":%u,\"sensor_midl\":%u,"
     "\"camera_ready\":%s,\"pixel_format\":\"GRAY8\",\"width\":%u,\"height\":%u,"
-    "\"external_fifo\":false,\"error\":\"%s\"}\n",
+    "\"external_fifo\":false,\"led_control\":%s,\"led_pin\":\"A6\",\"error\":\"%s\"}\n",
     FIRMWARE_VERSION, ESP.getChipModel(), ESP.getChipRevision(),
     sensorPID == OV7670_PID ? "OV7670" : "unidentified",
     sensorPID, sensorVER, sensorMIDH, sensorMIDL,
-    cameraReady ? "true" : "false", FRAME_WIDTH, FRAME_HEIGHT, cameraError);
+    cameraReady ? "true" : "false", FRAME_WIDTH, FRAME_HEIGHT,
+    illuminationReady ? "true" : "false", cameraError);
 }
 
 uint32_t frameCRC32(const uint8_t *data, size_t length) {
@@ -258,6 +338,11 @@ void sendFrame() {
 }
 
 void setup() {
+  // Enable the camera before USB identification; esp_camera also manages this
+  // pin during its initialization sequence and leaves it LOW while capturing.
+  gpio_set_level(static_cast<gpio_num_t>(CAM_PWDN), 0);
+  gpio_set_direction(static_cast<gpio_num_t>(CAM_PWDN), GPIO_MODE_OUTPUT);
+  initializeIllumination();  // Start at full illumination (A6 HIGH).
   Serial.begin(USB_BAUD);
   esp_log_level_set("*", ESP_LOG_NONE);  // Keep diagnostic text out of frame packets.
   // Camera initialization is deferred until the viewer requests its identity.
@@ -276,6 +361,10 @@ void loop() {
         sendIdentity();
       else if (strcmp(commandBuffer, "OV7670_FRAME") == 0)
         sendFrame();
+      else if (strncmp(commandBuffer, "OV7670_LED ", 11) == 0)
+        setIllumination(commandBuffer + 11);
+      else if (strcmp(commandBuffer, "OV7670_LED_STATUS") == 0)
+        sendIlluminationStatus();
       else if (strcmp(commandBuffer, "OV7670_DIAG") == 0)
         sendDiagnostics();
       else if (strcmp(commandBuffer, "OV7670_TEST_ON") == 0)

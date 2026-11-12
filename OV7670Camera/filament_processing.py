@@ -16,6 +16,8 @@ from array import array
 from collections.abc import Sequence
 import math
 
+INVERT_GRAYSCALE = bytes(range(255, -1, -1))
+
 
 @dataclass(frozen=True)
 class FilamentMeasurement:
@@ -32,6 +34,7 @@ class FilamentMeasurement:
     gradient_threshold: float
     gradient_window_size: int
     gradient_window_rows: tuple[int, ...]  # Actual row count after clipping, indexed by y.
+    light_filament_mode: bool
     gradient_mask: bytes  # 255 where an in-window adjacent-pixel gradient exceeds threshold.
     filament_mask: bytes  # 255 in each valid row interval [left, right); zero elsewhere.
     processed_rgb: bytes
@@ -165,27 +168,37 @@ def slice_edges(pixels: Sequence[float], offset: int, start: int, end: int,
 
 
 
-def measure_filaments(pixels: bytes, width: int, height: int,
-                      first_x: int, second_x: int, third_x: int, fourth_x: int,
-                      gradient_threshold: float = 20,
-                      gradient_window_size: int = 10) -> FilamentMeasurement:
+def measure_filament_windows(pixels: bytes, width: int, height: int,
+                             window_bounds: Sequence[tuple[int, int]],
+                             gradient_threshold: float = 20,
+                             gradient_window_size: int = 10,
+                             light_filament_mode: bool = False) -> FilamentMeasurement:
     if type(width) is not int or type(height) is not int or width < 3 or height < 1:
         raise ValueError("Image dimensions must be positive integers; width must be at least 3.")
     if len(pixels) != width * height:
         raise ValueError("Grayscale payload does not match the image dimensions.")
-    coordinates = (first_x, second_x, third_x, fourth_x)
-    if (any(type(value) is not int for value in coordinates)
-            or not 0 <= first_x < second_x < third_x < fourth_x <= width):
-        raise ValueError("Region coordinates must satisfy 0 <= x1 < x2 < x3 < x4 <= image width.")
+    if len(window_bounds) != 3:
+        raise ValueError("Provide three independent (start, end) filament windows.")
+    bounds = []
+    for pair in window_bounds:
+        if (len(pair) != 2 or any(type(value) is not int for value in pair)
+                or not 0 <= pair[0] < pair[1] <= width):
+            raise ValueError("Each window must satisfy 0 <= start < end <= image width.")
+        bounds.append(tuple(pair))
+    bounds = tuple(bounds)
     threshold = float(gradient_threshold)
     if not math.isfinite(threshold) or not 0 <= threshold <= 255:
         raise ValueError("Gradient threshold must be between 0 and 255.")
-    averaged, window_rows = vertical_average(pixels, width, height, gradient_window_size)
-    bounds = tuple(zip(coordinates, coordinates[1:]))
+    if type(light_filament_mode) is not bool:
+        raise ValueError("Light filament mode must be True or False.")
+    # Invert a working copy before smoothing or searching; camera bytes remain
+    # untouched for the raw preview. Overlays are added after inversion.
+    working_pixels = pixels.translate(INVERT_GRAYSCALE) if light_filament_mode else pixels
+    averaged, window_rows = vertical_average(working_pixels, width, height, gradient_window_size)
     rgb = bytearray(width * height * 3)
-    rgb[0::3] = pixels
-    rgb[1::3] = pixels
-    rgb[2::3] = pixels
+    rgb[0::3] = working_pixels
+    rgb[1::3] = working_pixels
+    rgb[2::3] = working_pixels
     gradient_mask = bytearray(width * height)
     filament_mask = bytearray(width * height)
     left_rows, right_rows, center_rows, widths = [], [], [], []
@@ -231,5 +244,21 @@ def measure_filaments(pixels: bytes, width: int, height: int,
         mean_widths_px=tuple(total / count if count else None for total, count in zip(totals, counts)),
         valid_rows=tuple(counts), gradient_threshold=threshold,
         gradient_window_size=gradient_window_size, gradient_window_rows=window_rows,
+        light_filament_mode=light_filament_mode,
         gradient_mask=bytes(gradient_mask), filament_mask=bytes(filament_mask),
         processed_rgb=bytes(rgb))
+
+
+def measure_filaments(pixels: bytes, width: int, height: int,
+                      first_x: int, second_x: int, third_x: int, fourth_x: int,
+                      gradient_threshold: float = 20,
+                      gradient_window_size: int = 10,
+                      light_filament_mode: bool = False) -> FilamentMeasurement:
+    """Compatibility interface for the former four shared boundaries."""
+    coordinates = (first_x, second_x, third_x, fourth_x)
+    if (any(type(value) is not int for value in coordinates)
+            or not 0 <= first_x < second_x < third_x < fourth_x <= width):
+        raise ValueError("Region coordinates must satisfy 0 <= x1 < x2 < x3 < x4 <= image width.")
+    return measure_filament_windows(
+        pixels, width, height, tuple(zip(coordinates, coordinates[1:])),
+        gradient_threshold, gradient_window_size, light_filament_mode)

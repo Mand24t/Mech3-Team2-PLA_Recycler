@@ -14,7 +14,8 @@ cross-sectional slices.
 The paper does not provide a complete edge-pairing specification. These are
 explicit choices in this implementation, rather than claimed exact author code:
 
-1. Keep the three windows [x1,x2), [x2,x3), [x3,x4). Do not inspect outer pixels.
+1. Use three independent windows [x1,x2), [x3,x4), [x5,x6), each with its
+   own start and end slider. Exclude pixels outside each window; gaps are allowed.
 2. Average each pixel vertically using the GUI's Gradient Window Size (default
    10), then compute abs(A[x] - A[x-1]) inside each window. Windows overlap with
    stride one row: size 10 uses y-4 through y+5. At image edges, clip to existing
@@ -63,7 +64,7 @@ require the filament to be darker than its background.
 
 Fractional centerlines are computed interval midpoints, not a claim of subpixel
 sensor accuracy. The raw image is preserved. Red markers enlarge with preview
-zoom; the four blue window guides remain three display pixels thick.
+zoom; the six blue window guides remain three display pixels thick.
 
 No image rectification, perpendicular-to-axis correction, texture reconstruction,
 or ovality calculation is added by segmentation. The separate diameter_geometry.py

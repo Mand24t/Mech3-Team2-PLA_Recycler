@@ -1,226 +1,510 @@
+
+#include <Arduino.h>
 #include <Servo.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
-// PLA Recycler - Arduino Mega 2560
-// NEO/SPARK MAX: D9 (servo-style PWM), DRV8871 fans: D6/D7
-// CL42T: STEP D30, DIR D31 (5V-compatible inputs)
-// HPS-2027 positional servo: D10 (external rated supply)
-// Requires matching RecyclerControl_Latest.py
+// ========================================
+// RECYCLER - ARDUINO MEGA RPM CONTROLLER
+// ========================================
 
-const byte EXTRUDER_PIN = 9;
-const byte FAN_IN1 = 6, FAN_IN2 = 7;
-const byte STEP_PIN = 30, DIR_PIN = 31;
-const byte GUIDE_PIN = 10;
-const float MOTOR_REFERENCE_RPM = 5000.0f; // calibration reference, NOT feedback
-const float GEAR_RATIO = 125.0f;
-const float MAX_SCREW_RPM = MOTOR_REFERENCE_RPM / GEAR_RATIO; // 40
-const float MAX_STEP_RPM = 60.0f;
-const float STEP_PULSES_PER_REV = 1600.0f; // verify CL42T setting
-const unsigned long STEP_PULSE_HIGH_US = 10;
-const unsigned long TIMEOUT_MS = 1200;
+// Pin assignments
+const byte CL_STEP = 30;
+const byte CL_DIR = 31;
 
-// Positional 270-degree guide servo. Actual travel must be verified unloaded.
-const float SERVO_HOME_DEG = 135.0f;
-const float SERVO_SAFE_MIN_DEG = 10.0f;
-const float SERVO_SAFE_MAX_DEG = 260.0f;
-const int SERVO_MIN_US = 500, SERVO_MAX_US = 2500;
-const unsigned long SERVO_INTERVAL_MS = 20;
+const byte DM_STEP = 40;
+const byte DM_DIR = 41;
 
-Servo spark, guide;
-float currentStepperRPM = 0;
-unsigned long stepPeriodUs = 0, nextStepUs = 0, stepFallUs = 0;
-bool stepHigh = false;
+const byte FAN_IN1 = 6;
+const byte FAN_IN2 = 7;
 
-// servoMode: 0 = detached/disabled, 1 = center, 2 = sweep, 3 = hold
-byte servoMode = 0;
-bool guideAttached = false;
-float servoAngle = SERVO_HOME_DEG, servoCenter = SERVO_HOME_DEG;
-float servoRange = 10.0f, servoSpeed = 15.0f;
-int sweepDirection = 1;
-unsigned long lastServoMs = 0;
+const byte SPARK_PIN = 9;
+const byte SWEEP_SERVO_PIN = 10;
 
-char lineBuffer[128];
-byte linePos = 0;
-unsigned long lastCommandMs = 0;
-bool timedOut = false;
+// Match pulses/revolution to driver switches
+const float CL_PPR = 1600.0;
+const float DM_PPR = 1600.0;
 
-void setExtruder(float screwRPM) {
-  screwRPM = constrain(screwRPM, 0.0f, MAX_SCREW_RPM);
-  // Reverse direction already tested on original machine.
-  int us = 1500 - (int)(500.0f * (screwRPM * GEAR_RATIO / MOTOR_REFERENCE_RPM) + 0.5f);
-  spark.writeMicroseconds(constrain(us, 1000, 1500));
-}
+// Initial conservative speed limit
+const float MAX_STEPPER_RPM = 20.0;
 
-void setFans(float percent) {
-  percent = constrain(percent, 0.0f, 100.0f);
-  digitalWrite(FAN_IN2, LOW);
-  if (percent <= 0.0f) digitalWrite(FAN_IN1, LOW);
-  else analogWrite(FAN_IN1, (int)(percent * 255.0f / 100.0f + 0.5f));
-}
+// Communication watchdog
+const unsigned long WATCHDOG_MS = 2500;
 
-void setStepper(float rpm) {
-  rpm = constrain(rpm, -MAX_STEP_RPM, MAX_STEP_RPM);
-  // Do not restart pulse schedule when repeated serial frames arrive.
-  if (fabsf(rpm - currentStepperRPM) < 0.001f) return;
-  currentStepperRPM = rpm;
-  digitalWrite(STEP_PIN, LOW);
-  stepHigh = false;
-  if (fabsf(rpm) < 0.001f) {
-    stepPeriodUs = 0;
+// CL42T disabled until hardware fault is fixed
+const bool CL_HARDWARE_READY = true;
+
+struct StepChannel {
+  byte stepPin;
+  byte dirPin;
+  float ppr;
+  float rpm;
+  unsigned long halfPeriodUs;
+  unsigned long lastToggleUs;
+  bool high;
+};
+
+StepChannel cl = {
+  CL_STEP, CL_DIR, CL_PPR, 0, 0, 0, false
+};
+
+StepChannel dm = {
+  DM_STEP, DM_DIR, DM_PPR, 0, 0, 0, false
+};
+
+Servo spark;
+Servo sweepServo;
+
+// Servo is intentionally not attached until SERVO command arrives.
+// Angles use centered coordinates: -90..+90 (0 = midpoint).
+float servoCenter = 0.0;
+float servoSpeed = 30.0;       // commanded degrees per second
+float servoBounds = 0.0;      // symmetric +/- degrees about center
+float servoPosition = 0.0;
+int servoDirection = 1;
+bool servoRunning = false;
+unsigned long servoLastUpdateMs = 0;
+
+
+int fanPwm = 0;
+int sparkPercent = 0;
+
+bool sparkArmed = false;
+
+unsigned long lastContact = 0;
+
+char input[80];
+byte inputLength = 0;
+
+// ========================================
+// STEPPER CONTROL
+// ========================================
+
+void setStepper(StepChannel &m, float rpm) {
+  rpm = constrain(
+    rpm, -MAX_STEPPER_RPM, MAX_STEPPER_RPM
+  );
+
+  digitalWrite(m.stepPin, LOW);
+  m.high = false;
+  m.rpm = rpm;
+
+  if (rpm == 0) {
+    m.halfPeriodUs = 0;
     return;
   }
-  digitalWrite(DIR_PIN, rpm >= 0 ? HIGH : LOW);
-  float period = 60000000.0f / (fabsf(rpm) * STEP_PULSES_PER_REV);
-  stepPeriodUs = max((unsigned long)(period + 0.5f), STEP_PULSE_HIGH_US + 15UL);
-  nextStepUs = micros() + 50UL;
+
+  digitalWrite(
+    m.dirPin, rpm >= 0 ? HIGH : LOW
+  );
+
+  float pulseRate =
+    fabs(rpm) * m.ppr / 60.0;
+
+  m.halfPeriodUs =
+    (unsigned long)(500000.0 / pulseRate);
+
+  if (m.halfPeriodUs < 10) {
+    m.halfPeriodUs = 10;
+  }
+
+  m.lastToggleUs = micros();
 }
 
-void runStepper() {
-  if (!stepPeriodUs) return;
+void tickStepper(StepChannel &m) {
+  if (m.halfPeriodUs == 0) return;
+
   unsigned long now = micros();
-  if (stepHigh) {
-    if ((long)(now - stepFallUs) >= 0) {
-      digitalWrite(STEP_PIN, LOW);
-      stepHigh = false;
-    }
-  } else if ((long)(now - nextStepUs) >= 0) {
-    digitalWrite(STEP_PIN, HIGH);
-    stepHigh = true;
-    stepFallUs = now + STEP_PULSE_HIGH_US;
-    nextStepUs = now + stepPeriodUs;
+
+  if ((unsigned long)(
+      now - m.lastToggleUs
+      ) >= m.halfPeriodUs) {
+
+    m.high = !m.high;
+
+    digitalWrite(
+      m.stepPin, m.high ? HIGH : LOW
+    );
+
+    m.lastToggleUs = now;
   }
 }
 
-void writeGuideAngle(float angle) {
-  angle = constrain(angle, SERVO_SAFE_MIN_DEG, SERVO_SAFE_MAX_DEG);
-  int us = SERVO_MIN_US + (int)(angle / 270.0f * (SERVO_MAX_US - SERVO_MIN_US) + 0.5f);
-  guide.writeMicroseconds(us);
+// ========================================
+// FAN CONTROL
+// ========================================
+
+void setFan(int pwm) {
+  fanPwm = constrain(pwm, 0, 255);
+
+  digitalWrite(FAN_IN2, LOW);
+  analogWrite(FAN_IN1, fanPwm);
 }
 
-bool servoSettingsValid(float range, float speed, float offset) {
-  float center = SERVO_HOME_DEG + offset;
-  return isfinite(range) && isfinite(speed) && isfinite(offset) &&
-         range >= 0 && range <= 125 && speed > 0 && speed <= 180 &&
-         center - range >= SERVO_SAFE_MIN_DEG &&
-         center + range <= SERVO_SAFE_MAX_DEG;
+// ========================================
+// SPARK MAX CONTROL
+// ========================================
+
+void setSpark(int percent) {
+  sparkPercent = constrain(
+    percent, -100, 100
+  );
+
+  // Assumes RC PWM mode with 1500us neutral
+  spark.writeMicroseconds(
+    1500 + sparkPercent * 5
+  );
 }
 
-void disableGuide() {
-  servoMode = 0;
-  if (guideAttached) {
-    guide.detach();
-    guideAttached = false;
-  }
+// ========================================
+// D10 SWEEP SERVO CONTROL (NON-BLOCKING)
+// ========================================
+
+void stopSweepServo() {
+  servoRunning = false;
+  if (sweepServo.attached()) sweepServo.detach();
 }
 
-void setGuide(byte mode, float range, float speed, float offset) {
-  if (mode == 0) { disableGuide(); return; }
-  if (mode > 3 || !servoSettingsValid(range, speed, offset)) return;
-  float newCenter = SERVO_HOME_DEG + offset;
-  bool wasSweeping = (servoMode == 2);
-  servoCenter = newCenter;
-  servoRange = range;
+void startSweepServo(float center, float speed, float bounds) {
+  stopSweepServo();
+
+  servoCenter = center;
   servoSpeed = speed;
-  if (!guideAttached) {
-    // On initial attach, the physical position is unknown. Unload before testing.
-    servoAngle = servoCenter;
-    guide.attach(GUIDE_PIN, SERVO_MIN_US, SERVO_MAX_US);
-    guideAttached = true;
-    writeGuideAngle(servoAngle);
-  }
-  if (mode == 2 && !wasSweeping) sweepDirection = 1;
-  servoMode = mode;
+  servoBounds = bounds;
+  servoPosition = center;
+  servoDirection = 1;
+  servoLastUpdateMs = millis();
+
+  // Command center first, then enable servo pulses.
+  sweepServo.write(constrain((int)round(90.0 + center), 0, 180));
+  sweepServo.attach(SWEEP_SERVO_PIN);
+  servoRunning = true;
 }
 
-void runGuide() {
+void tickSweepServo() {
+  if (!servoRunning) return;
+
   unsigned long now = millis();
-  if (now - lastServoMs < SERVO_INTERVAL_MS) return;
-  float dt = (now - lastServoMs) / 1000.0f;
-  lastServoMs = now;
-  if (!guideAttached || servoMode == 0 || servoMode == 3) return;
-  if (dt > 0.1f) dt = 0.1f;
-  float goal = servoCenter;
-  if (servoMode == 2) goal += sweepDirection > 0 ? servoRange : -servoRange;
-  float maxChange = servoSpeed * dt;
-  if (servoAngle < goal) servoAngle = fminf(servoAngle + maxChange, goal);
-  else if (servoAngle > goal) servoAngle = fmaxf(servoAngle - maxChange, goal);
-  writeGuideAngle(servoAngle);
-  if (servoMode == 2 && fabsf(servoAngle - goal) < 0.01f) sweepDirection = -sweepDirection;
+  unsigned long elapsedMs = now - servoLastUpdateMs;
+  if (elapsedMs < 20) return;
+  servoLastUpdateMs = now;
+
+  float low = servoCenter - servoBounds;
+  float high = servoCenter + servoBounds;
+  float remaining = servoSpeed * (elapsedMs / 1000.0);
+
+  // Reflect at the boundaries, including when an iteration overshoots.
+  // Limit to a bounded iteration count to protect the main loop.
+  if (servoBounds <= 0.0) {
+    servoPosition = servoCenter;
+  } else {
+    float width = high - low;
+    float phase = (servoDirection > 0)
+      ? (servoPosition - low)
+      : (2.0 * width - (servoPosition - low));
+    phase = fmod(phase + remaining, 2.0 * width);
+    if (phase <= width) {
+      servoPosition = low + phase;
+      servoDirection = (phase == width) ? -1 : 1;
+    } else {
+      servoPosition = high - (phase - width);
+      servoDirection = -1;
+    }
+  }
+
+  // 0..180 is the standard Servo library API; never command beyond
+  // -90..+90 relative to the assumed 90-degree midpoint.
+  int servoAngle = constrain((int)round(90.0 + servoPosition), 0, 180);
+  sweepServo.write(servoAngle);
 }
 
-void stopAll(bool detachServo = true) {
-  setExtruder(0);
-  setFans(0);
-  setStepper(0);
-  if (detachServo) disableGuide();
-  else servoMode = 3;
+// ========================================
+// STOP ALL
+// ========================================
+
+void stopAll() {
+  setStepper(cl, 0);
+  setStepper(dm, 0);
+  setFan(0);
+  setSpark(0);
+  stopSweepServo();
+
+  sparkArmed = false;
 }
 
-// Serial frame: SET,<screwRPM>,<signedStepperRPM>,<fanPercent>,<servoMode>,<range>,<speed>,<offset>
-// Example: SET,5,10,50,0,10,15,0
-// STOP disables all channels including servo output.
-void processLine(char *line) {
-  if (strcmp(line, "STOP") == 0) {
-    stopAll(true);
-    lastCommandMs = millis();
-    timedOut = false;
+// ========================================
+// STATUS
+// ========================================
+
+void printStatus() {
+  Serial.print(F("STATUS CL="));
+  Serial.print(cl.rpm, 2);
+
+  Serial.print(F(" DM="));
+  Serial.print(dm.rpm, 2);
+
+  Serial.print(F(" FAN="));
+  Serial.print(fanPwm);
+
+  Serial.print(F(" SPARK="));
+  Serial.print(sparkPercent);
+
+  Serial.print(F(" ARM="));
+  Serial.print(sparkArmed ? 1 : 0);
+
+  Serial.print(F(" SERVO="));
+  Serial.print(servoRunning ? 1 : 0);
+
+  Serial.print(F(" SCENTER="));
+  Serial.print(servoCenter, 1);
+
+  Serial.print(F(" SSPEED="));
+  Serial.print(servoSpeed, 1);
+
+  Serial.print(F(" SBOUNDS="));
+  Serial.print(servoBounds, 1);
+
+  Serial.print(F(" CL_READY="));
+  Serial.println(
+    CL_HARDWARE_READY ? 1 : 0
+  );
+}
+
+// ========================================
+// COMMAND PARSING
+// ========================================
+
+bool parseNumber(char *s, float &value) {
+  if (!s || !*s) return false;
+
+  char *end;
+  value = strtod(s, &end);
+
+  return end != s &&
+         *end == '\0' &&
+         isfinite(value);
+}
+
+void processCommand(char *line) {
+  char *arg = strchr(line, ' ');
+
+  if (arg) {
+    *arg = '\0';
+    ++arg;
+  }
+
+  if (!strcmp(line, "PING")) {
+    Serial.println(F("PONG"));
     return;
   }
-  if (strncmp(line, "SET,", 4) != 0) return;
-  float data[7];
-  char *p = line + 4;
-  for (byte i = 0; i < 7; i++) {
-    char *end;
-    data[i] = strtod(p, &end);
-    if (end == p || !isfinite(data[i])) return;
-    if (i < 6) {
-      if (*end != ',') return;
-      p = end + 1;
-    } else if (*end != '\0') return;
+
+  if (!strcmp(line, "STATUS")) {
+    printStatus();
+    return;
   }
-  if (data[3] != floorf(data[3]) || data[3] < 0 || data[3] > 3) return;
-  if (!servoSettingsValid(data[4], data[5], data[6])) return;
-  setExtruder(data[0]);
-  setStepper(data[1]);
-  setFans(data[2]);
-  setGuide((byte)data[3], data[4], data[5], data[6]);
-  lastCommandMs = millis();
-  timedOut = false;
+
+  if (!strcmp(line, "STOP")) {
+    stopAll();
+    Serial.println(F("OK STOP"));
+    return;
+  }
+
+  if (!strcmp(line, "ARM")) {
+    setSpark(0);
+    sparkArmed = true;
+    Serial.println(F("OK ARM"));
+    return;
+  }
+
+  if (!strcmp(line, "SERVOSTOP")) {
+    stopSweepServo();
+    Serial.println(F("OK SERVOSTOP"));
+    return;
+  }
+
+  if (!strcmp(line, "SERVO")) {
+    // SERVO <center_deg> <speed_deg_per_sec> <half_range_deg>
+    char *centerArg = arg ? strtok(arg, " \t") : NULL;
+    char *speedArg = centerArg ? strtok(NULL, " \t") : NULL;
+    char *boundsArg = speedArg ? strtok(NULL, " \t") : NULL;
+    char *extraArg = boundsArg ? strtok(NULL, " \t") : NULL;
+    float center, speed, bounds;
+
+    if (!centerArg || !speedArg || !boundsArg || extraArg ||
+        !parseNumber(centerArg, center) ||
+        !parseNumber(speedArg, speed) ||
+        !parseNumber(boundsArg, bounds)) {
+      Serial.println(F("ERR SERVO_ARGS"));
+      return;
+    }
+    if (center < -90 || center > 90 ||
+        speed <= 0 || speed > 360 ||
+        bounds < 0 || bounds > 90 ||
+        center - bounds < -90 || center + bounds > 90) {
+      Serial.println(F("ERR SERVO_RANGE"));
+      return;
+    }
+
+    startSweepServo(center, speed, bounds);
+    Serial.println(F("OK SERVO"));
+    return;
+  }
+
+  float value;
+
+  if (!parseNumber(arg, value)) {
+    Serial.println(F("ERR NUMBER"));
+    return;
+  }
+
+  if (!strcmp(line, "DMRPM") ||
+      !strcmp(line, "CLRPM")) {
+
+    if (fabs(value) > MAX_STEPPER_RPM) {
+      Serial.println(F("ERR RPM_LIMIT"));
+      return;
+    }
+
+    if (!strcmp(line, "CLRPM")) {
+
+      if (!CL_HARDWARE_READY && value != 0) {
+        Serial.println(
+          F("ERR CL_FAULT_LOCKOUT")
+        );
+        return;
+      }
+
+      setStepper(cl, value);
+      Serial.println(F("OK CLRPM"));
+
+    } else {
+      setStepper(dm, value);
+      Serial.println(F("OK DMRPM"));
+    }
+  }
+
+  else if (!strcmp(line, "FAN")) {
+
+    if (value < 0 ||
+        value > 255 ||
+        value != floor(value)) {
+      Serial.println(F("ERR FAN_RANGE"));
+      return;
+    }
+
+    setFan((int)value);
+    Serial.println(F("OK FAN"));
+  }
+
+  else if (!strcmp(line, "SPARK")) {
+
+    if (value < -100 ||
+        value > 100 ||
+        value != floor(value)) {
+      Serial.println(F("ERR SPARK_RANGE"));
+      return;
+    }
+
+    if (value != 0 && !sparkArmed) {
+      Serial.println(
+        F("ERR SPARK_NOT_ARMED")
+      );
+      return;
+    }
+
+    setSpark((int)value);
+    Serial.println(F("OK SPARK"));
+  }
+
+  else {
+    Serial.println(F("ERR UNKNOWN"));
+  }
 }
+
+// ========================================
+// SETUP
+// ========================================
 
 void setup() {
-  pinMode(FAN_IN1, OUTPUT); pinMode(FAN_IN2, OUTPUT);
-  pinMode(STEP_PIN, OUTPUT); pinMode(DIR_PIN, OUTPUT);
-  digitalWrite(FAN_IN1, LOW); digitalWrite(FAN_IN2, LOW);
-  digitalWrite(STEP_PIN, LOW); digitalWrite(DIR_PIN, LOW);
-  spark.attach(EXTRUDER_PIN, 1000, 2000);
-  spark.writeMicroseconds(1500);
-  // HPS-2027 remains detached until explicit CENTER or SWEEP.
+  pinMode(CL_STEP, OUTPUT);
+  pinMode(CL_DIR, OUTPUT);
+
+  pinMode(DM_STEP, OUTPUT);
+  pinMode(DM_DIR, OUTPUT);
+
+  pinMode(FAN_IN1, OUTPUT);
+  pinMode(FAN_IN2, OUTPUT);
+
+  digitalWrite(CL_STEP, LOW);
+  digitalWrite(DM_STEP, LOW);
+
+  digitalWrite(FAN_IN1, LOW);
+  digitalWrite(FAN_IN2, LOW);
+
+  spark.attach(
+    SPARK_PIN, 1000, 2000
+  );
+
+  stopAll();
+
   Serial.begin(115200);
-  lastCommandMs = millis();
-  lastServoMs = millis();
-  stopAll(true);
+
+  lastContact = millis();
+
+  Serial.println(
+    F("RECYCLER_READY_V2")
+  );
 }
 
+// ========================================
+// MAIN LOOP
+// ========================================
+
 void loop() {
-  runStepper();
-  runGuide();
-  byte count = 0;
-  while (Serial.available() > 0 && count++ < 32) {
+  tickStepper(cl);
+  tickStepper(dm);
+  tickSweepServo();
+
+  while (Serial.available()) {
     char c = (char)Serial.read();
+
     if (c == '\n') {
-      lineBuffer[linePos] = '\0';
-      processLine(lineBuffer);
-      linePos = 0;
-    } else if (c != '\r') {
-      if (linePos < sizeof(lineBuffer) - 1) lineBuffer[linePos++] = c;
-      else linePos = 0;
+      input[inputLength] = '\0';
+
+      if (inputLength) {
+        lastContact = millis();
+        processCommand(input);
+      }
+
+      inputLength = 0;
+    }
+
+    else if (c != '\r') {
+      if (inputLength < sizeof(input) - 1) {
+        input[inputLength++] = c;
+      } else {
+        inputLength = 0;
+      }
     }
   }
-  if (!timedOut && millis() - lastCommandMs > TIMEOUT_MS) {
-    stopAll(true);
-    timedOut = true;
+
+  if ((unsigned long)(
+      millis() - lastContact
+      ) > WATCHDOG_MS) {
+
+    if (cl.rpm != 0 ||
+        dm.rpm != 0 ||
+        fanPwm ||
+        sparkPercent ||
+        sparkArmed ||
+        servoRunning) {
+
+      stopAll();
+
+      Serial.println(
+        F("WATCHDOG_STOP")
+      );
+    }
   }
 }

@@ -27,18 +27,18 @@ Existing unknown Nano firmware may use another protocol; in that case detection
 reports that no compatible firmware replied. An OV7670 itself has configuration
 registers, not a USB interface or a PC-streaming program.
 
-The second camera panel and selector are present. ESP32-CAM acquisition is reserved
-for the next stage. The raw grayscale frame and a synchronized processed view are displayed side by
-side. Four sliders, labelled "1st region x coordinate" through "4th region x
-coordinate", position four blue vertical guide lines on the processed view.
-All guides are 3 display pixels thick. Coordinates are source-image boundary
-positions and remain ordered: 0 <= x1 < x2 < x3 < x4 <= image width.
-The left, middle, and right search windows lie between consecutive guides.
-Pixels to the left of x1 or at/after x4 remain visible but are excluded from
-center, gradient, and width calculations. The rightmost limit may equal the
-image width. The initial limits are 20, 106, 213, and 320 for a 320-pixel frame.
-Their ranges and positions scale with received resolution. Moving any slider
-immediately reprocesses the latest frame; the raw image is unchanged.
+The collapsible connection panel contains the USB port and baud rate for the
+Nano ESP32 + OV7670. The raw grayscale frame and a synchronized processed view are displayed side by
+side. Six sliders give Left, Middle, and Right independent start/end x
+coordinates in source pixels. All six guides are blue and 3 display pixels thick.
+Each pair must satisfy 0 <= start < end <= image width. Moving one endpoint
+clamps it only against its partner; it never moves or constrains another view.
+Windows may have gaps or overlap. Pixels outside all windows remain visible but
+are excluded from measurements. Regions use [start,end), so the end may equal
+image width. Defaults are Left 20-106, Middle 106-213, Right 213-320, preserving
+the previous search coverage; coincident guides are drawn in the same position
+until separated. Each pair scales independently when resolution changes.
+Moving a slider immediately reprocesses the latest frame.
 Horizontal-gradient boundary detection and per-row pixel widths are now
 implemented as described below. Physical geometry and scalar calibration now
 provide diameter in millimetres. Further optical calibration
@@ -74,10 +74,14 @@ Supplied wiring, translated to raw GPIOs for esp_camera:
 | D5 | D11 | 38 |
 | D6 | D12 | 47 |
 | D7 | D13 | 48 |
+| RESET | A0 | 1 |
+| PWDN | A7 | 14 |
 
-RESET and PWDN were not specified in the wiring. The sketch does not drive them
-(pin -1). If the module exposes these inputs, confirm RESET is held high and PWDN
-low by its wiring or onboard pulls. We have not assumed that this is already done.
+RESET is now wired to A0 (raw GPIO1), driven by the camera driver's reset
+sequence. Firmware 1.4 drives PWDN on A7 (raw GPIO14) LOW at startup and
+passes the pin to the camera driver, which leaves it LOW during normal capture.
+The illumination LED connects to A6 (raw GPIO13) through a current-limiting
+series resistor, returning to GND.
 
 Capture is 320 x 240, 8-bit grayscale, one PSRAM frame buffer, nominal XCLK 10 MHz.
 No external FIFO, Wi-Fi, RGB transfer, JPEG, or threshold-to-one-bit conversion
@@ -171,11 +175,11 @@ Earlier missing-bit findings are retained as history in DIAGNOSTIC_FINDINGS.md.
 
 ## Gradient control and pixel-width diagnostics
 
-The Control Panel contains the four region sliders and a numerical
+The Control Panel contains the six region sliders and a numerical
 **Gradient Threshold (0-255)** entry. The default threshold is 20. Finite numbers
 in the inclusive range 0-255 are accepted; invalid/empty input keeps the last
 valid threshold applied and displays an explicit message. Editing the threshold
-or moving a divider reprocesses the latest frame immediately.
+or moving a window boundary reprocesses the latest frame immediately.
 
 **Gradient Window Size** defaults to 10 and accepts positive whole numbers.
 Before computing the horizontal gradient, each pixel is averaged with vertical
@@ -188,8 +192,8 @@ valid setting. Larger windows reduce row-specific noise but can smooth genuine
 changes along y, and adjacent measurements share samples. This does not change
 the raw preview or average across frames or horizontal regions.
 
-The three full-height windows are [x1, x2), [x2, x3), and [x3, x4), named
-Left, Middle, Right. Outer pixels are ignored. Each window must contain one
+The three full-height windows are [x1, x2), [x3, x4), and [x5, x6), named
+Left, Middle, Right. Pixels outside these independent pairs are ignored. Each window must contain one
 filament with both edges visible; it may be dark, bright, or show internal rims.
 
 The processor now uses paper-inspired per-slice segmentation, adapted from
@@ -218,7 +222,7 @@ conversion and scalar calibration are described below.
 The processed RGB image preserves grayscale values except for one-source-pixel
 red markers at both boundaries and the computed center of each valid row segment.
 A fully detected row has nine red pixels. Invalid rows have no fabricated width,
-centerline, or markers. Red pixels enlarge with zoom. All four blue guides remain
+centerline, or markers. Red pixels enlarge with zoom. All six blue guides remain
 three display pixels thick and are overlaid on the processed preview.
 
 The Diagnostics Panel below both views displays average pixel widths for Left,
@@ -259,7 +263,7 @@ Three physical stop-during-capture/reconnect cycles passed with this change.
 
 Startup options can restore controls without changing their normal defaults:
 
-    .\.venv-camera\Scripts\python.exe OV7670Camera\ov7670_viewer.py --connect --first-x 20 --second-x 160 --third-x 259 --fourth-x 320 --threshold 20 --gradient-window-size 10
+    .\.venv-camera\Scripts\python.exe OV7670Camera\ov7670_viewer.py --connect --left-start 20 --left-end 100 --middle-start 110 --middle-end 205 --right-start 220 --right-end 320 --threshold 20 --gradient-window-size 10
 
 See validation/signal_check_20261027_025332/FINDINGS.md for the subsequent noise
 check: all eight bits active, twenty identical internal test-pattern frames,
@@ -267,7 +271,7 @@ and a 100-frame normal run with no CRC errors. Earlier tearing was not reproduce
 after the USB reset; intermittent electrical/optical causes remain possible.
 
 
-The four-coordinate measurement API is:
+The former four-coordinate measurement API remains available for compatibility:
 
     measure_filaments(pixels, width, height, x1, x2, x3, x4, gradient_threshold=20, gradient_window_size=10)
 
@@ -354,3 +358,98 @@ controls. Both sections start expanded; hiding preserves every value and keeps
 capture and processing running. Connection buttons, connection status, frame
 views, and diagnostics stay visible. The Filament Distance and Correction
 Coefficient labels and entered values are red to identify the variable controls.
+
+
+## A6 illumination slider (firmware 1.5)
+
+The Control Panel contains LED Brightness - A6 [0-255] (variable), in red.
+The default is 255 (full brightness, continuous HIGH at approximately 3.3 V).
+Zero is continuous LOW/off. Intermediate
+values control PWM duty at 20 kHz with 8-bit resolution. This adjusts average LED
+brightness, not a DAC or a variable HIGH voltage. A series current-limiting
+resistor is installed for this LED. High-current illumination needs a suitable
+external driver rather than being powered directly by a GPIO.
+
+NanoOV7670USB firmware 1.3 introduced RESET on A0/GPIO1 and illumination on
+A6/GPIO13. Camera XCLK retains LEDC timer 0/channel 0; illumination uses timer
+1/channel 2. Raw GPIO APIs avoid Nano Arduino pin-number remapping ambiguity.
+Firmware 1.5 latches A6 HIGH before enabling its output. The board and viewer
+start each connection at 255. The viewer attempts to turn the LED off on orderly
+disconnect. At 0/255 the firmware uses explicit LEDC idle LOW/HIGH rather than
+a PWM counter endpoint; intermediate levels resume PWM on the same channel. An abrupt program
+termination may leave the previous output active until the board resets.
+
+The identity reply advertises led_control:true when PWM initialization succeeds.
+Older camera firmware still streams normally, but the slider is disabled with an
+upgrade message. The viewer sends OV7670_LED <integer 0..255> and waits for
+OV7670_LED {"value":<integer>} before another frame request. Only the acquisition
+worker accesses the USB stream, and rapid slider changes coalesce to the newest
+value between frames. Applied brightness is shown only after acknowledgement.
+The frame packet format is unchanged. Firmware must be uploaded to use this
+slider; editing the PC files alone does not update the Nano.
+
+
+### Illumination troubleshooting
+
+A6 is raw GPIO13, not raw GPIO6. Firmware 1.5 enables input readback on that
+output and adds OV7670_LED_STATUS, which replies with OV7670_DIAG JSON containing
+led_gpio, led_value, led_ready, high_samples, samples, sample_us, and pwm_hz.
+A static HIGH should read all samples HIGH, and static LOW all samples LOW;
+intermediate PWM should produce both levels. This reads the GPIO logic threshold,
+not voltage, current, or emitted light. Measure A6 to GND with a multimeter to
+check the voltage under load. Then check the series path A6 -> 220 ohm resistor
+-> LED anode (+) -> LED cathode (-) -> GND. Resistor position in the same series
+path may be before or after the LED. An LED's flat edge usually identifies its
+cathode. Do not infer an LED is lit solely from a successful USB acknowledgement.
+
+
+## Access denied when connecting
+
+The Nano's COM port can be used by only one serial client at a time. The rebuilt
+Launch Camera.exe restores an existing camera viewer rather than launching a
+second copy. Leave the connected viewer running and use that window. Close
+Arduino Serial Monitor or another separately launched Python viewer before
+connecting. Direct Python launches do not use the EXE's duplicate-launch check.
+
+
+## Light filament mode
+
+The Control Panel button labelled light filament mode is an on/off toggle,
+initially off. When on, each grayscale pixel in a working copy becomes 255-I
+before vertical averaging, gradient calculations, polarity selection, or edge
+searching. The processed preview uses this inverted image, then adds the red
+markers and blue guides in their normal colors. The raw preview always displays
+the original camera pixels. Clicking again restores normal processing, and each
+click reprocesses the current frame immediately without waiting for a new one.
+The selection remains in effect for subsequent frames during the GUI session.
+
+FilamentMeasurement.light_filament_mode records the processing polarity.
+measure_filaments(..., light_filament_mode=True) uses the same preprocessing
+path outside the GUI. Inversion does not increase contrast or gradient magnitude;
+the existing polarity-aware detector can therefore return the same numerical
+widths for a frame in either mode. This option changes the actual working pixels
+and processed display, without changing thresholds or edge-pairing rules.
+No camera firmware upload is required.
+
+
+## Independent filament windows
+
+The primary measurement API is now:
+
+    measure_filament_windows(pixels, width, height,
+                             ((left_start, left_end), (middle_start, middle_end),
+                              (right_start, right_end)),
+                             gradient_threshold=20, gradient_window_size=10,
+                             light_filament_mode=False)
+
+Three pairs are required, but pairs need not touch or be globally ordered.
+Left/Middle/Right identify the assigned measurement slots; overlapping windows
+measure their contents independently. Keep one filament and both its edges in
+each window. All six coordinates participate in the frame-processing cache, so
+changing either endpoint updates widths and derived diameter immediately.
+
+Use --left-start/--left-end, --middle-start/--middle-end, and
+--right-start/--right-end to restore six coordinates at startup. The old
+--first-x/--second-x/--third-x/--fourth-x options still map shared boundaries
+to the three formerly adjacent windows; explicit start/end options override
+individual coordinates. --light-filament-mode enables inversion at startup.

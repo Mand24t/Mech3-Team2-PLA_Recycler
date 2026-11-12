@@ -17,7 +17,7 @@ import zlib
 import tkinter as tk
 from tkinter import ttk
 
-from filament_processing import measure_filaments
+from filament_processing import measure_filament_windows
 from diameter_geometry import diameter_scales, mean_diameter
 
 try:
@@ -131,6 +131,32 @@ class CameraProtocol:
         raise CameraError("USB port opened, but no compatible camera firmware replied. "
                           "The OV7670 sensor itself is not a USB camera; the Nano needs the capture sketch.")
 
+    def set_illumination(self, value: int, timeout: float = 2.0) -> None:
+        if type(value) is not int or not 0 <= value <= 255:
+            raise ValueError("LED brightness must be an integer from 0 to 255.")
+        self.stream.write(f"OV7670_LED {value}\n".encode("ascii"))
+        deadline = time.monotonic() + timeout
+        line = bytearray()
+        while True:
+            byte = self.read_exact(1, deadline)
+            if byte == b"\n":
+                if line.startswith(b"OV7670_LED "):
+                    try:
+                        reply = json.loads(line[len(b"OV7670_LED "):])
+                    except (ValueError, UnicodeError) as error:
+                        raise CameraError("Malformed LED acknowledgement.") from error
+                    if (not isinstance(reply, dict) or type(reply.get("value")) is not int
+                            or reply["value"] != value):
+                        raise CameraError("LED acknowledgement does not match the requested brightness.")
+                    return
+                if line.startswith(ERROR_PREFIX):
+                    raise CameraError(line[len(ERROR_PREFIX):].decode("utf-8", errors="replace"))
+                line.clear()
+            else:
+                line.extend(byte)
+                if len(line) > 2048:
+                    raise CameraError("Oversized LED acknowledgement.")
+
     def request_frame(self) -> Frame:
         self.stream.write(b"OV7670_FRAME\n")
         deadline = time.monotonic() + 12.0
@@ -180,9 +206,18 @@ class CameraWorker(threading.Thread):
         self.events = events
         self.frames = frames
         self.stop = threading.Event()
+        self.illumination_lock = threading.Lock()
+        self.illumination_value = 255
+
+    def set_illumination(self, value: int):
+        if type(value) is not int or not 0 <= value <= 255:
+            raise ValueError("LED brightness must be an integer from 0 to 255.")
+        with self.illumination_lock:
+            self.illumination_value = value
 
     def run(self):
         connection = None
+        led_supported = False
         try:
             if serial is None:
                 raise CameraError("pyserial is not installed.")
@@ -199,7 +234,16 @@ class CameraWorker(threading.Thread):
             self.events.put(("identity", info))
             if not info["camera_ready"]:
                 raise CameraError("Nano detected; camera not ready: " + str(info.get("error", "unknown error")))
+            led_supported = info.get("led_control") is True
+            applied_illumination = None
             while not self.stop.is_set():
+                with self.illumination_lock:
+                    desired_illumination = self.illumination_value
+                if led_supported and desired_illumination != applied_illumination:
+                    # Serialize with frame transfers: Tk never writes to the USB port.
+                    protocol.set_illumination(desired_illumination)
+                    applied_illumination = desired_illumination
+                    self.events.put(("illumination", applied_illumination))
                 put_latest(self.frames, protocol.request_frame())
         except (CameraError, OSError, ValueError) as error:
             if not self.stop.is_set():
@@ -216,7 +260,9 @@ class CameraWorker(threading.Thread):
                             chunk = connection.read(max(1, min(connection.in_waiting, 65536)))
                             if chunk:
                                 idle_deadline = time.monotonic() + 0.5
-                except (OSError, ValueError):
+                        if led_supported:
+                            CameraProtocol(connection, threading.Event(), self.baud).set_illumination(0, timeout=1)
+                except (CameraError, OSError, ValueError):
                     pass
                 finally:
                     connection.close()
@@ -271,19 +317,17 @@ class CameraViewer:
         root.geometry(f"1200x{min(1080, root.winfo_screenheight() - 70)}")
         root.minsize(1000, 900)
         root.protocol("WM_DELETE_WINDOW", self.close)
-        self.camera = tk.StringVar(value="OV7670")
         self.port = tk.StringVar()
         self.baud = tk.StringVar(value=str(BAUD))
         self.status = tk.StringVar(value="Disconnected. Connect the Nano by USB, then detect the camera.")
         self.identity = tk.StringVar(value="Sensor identity has not been read.")
         self.frame_status = tk.StringVar(value="No frame received.")
-        self.region_x1 = tk.IntVar(value=20)
-        self.region_x2 = tk.IntVar(value=106)
-        self.region_x3 = tk.IntVar(value=213)
-        self.region_x4 = tk.IntVar(value=320)
-        self.region_coordinates = [self.region_x1, self.region_x2, self.region_x3, self.region_x4]
+        self.region_coordinates = [tk.IntVar(value=value) for value in (20, 106, 106, 213, 213, 320)]
+        (self.region_x1, self.region_x2, self.region_x3, self.region_x4,
+         self.region_x5, self.region_x6) = self.region_coordinates
         self.gradient_threshold_input = tk.StringVar(value="20")
         self.gradient_window_size_input = tk.StringVar(value="10")
+        self.light_filament_mode = tk.BooleanVar(value=False)
         self.processing_status = tk.StringVar(value="Waiting for a camera frame.")
         self.mean_width_vars = [tk.StringVar(value="N/A") for _ in range(3)]
         self.instantaneous_diameter = tk.StringVar(value="")
@@ -297,23 +341,18 @@ class CameraViewer:
         self.calibration_status = tk.StringVar(value="")
         self.base_diameter = None
         self.geometry_scales = None
+        self.illumination = tk.IntVar(value=255)
+        self.illumination_supported = False
+        self.illumination_status = tk.StringVar(value="Connect LED-capable camera firmware to enable illumination.")
         main = ttk.Frame(root, padding=14)
         main.pack(fill="both", expand=True)
         ttk.Label(main, text="USB CAMERA VIEWER", font=("Segoe UI", 17, "bold")).pack(anchor="w")
         style = ttk.Style(root)
         style.configure("Section.TButton", anchor="w", font=("Segoe UI", 10, "bold"))
-        self.connection_section = CollapsibleSection(main, "Camera Connection")
+        self.connection_section = CollapsibleSection(main, "Nano ESP32 + OV7670 / USB Connection")
         self.connection_section.pack(fill="x", pady=(8, 0))
-        switch = ttk.Frame(self.connection_section.content)
-        switch.pack(fill="x", pady=(8, 8))
-        ttk.Label(switch, text="Camera:").pack(side="left")
-        for title, value in [("Nano ESP32 + OV7670", "OV7670"), ("ESP32-CAM (next stage)", "ESP32-CAM")]:
-            ttk.Radiobutton(switch, text=title, value=value, variable=self.camera,
-                            command=self.camera_changed).pack(side="left", padx=10)
-        panels = ttk.Frame(self.connection_section.content)
-        panels.pack(fill="x")
-        nano = ttk.LabelFrame(panels, text="Nano ESP32 + OV7670 / USB", padding=10)
-        nano.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        nano = ttk.Frame(self.connection_section.content, padding=10)
+        nano.pack(fill="x")
         ttk.Label(nano, text="USB serial port").grid(row=0, column=0, sticky="w")
         self.port_box = ttk.Combobox(nano, textvariable=self.port, state="readonly", width=35)
         self.port_box.grid(row=0, column=1, sticky="ew", padx=8)
@@ -322,11 +361,6 @@ class CameraViewer:
                                      values=("921600", "460800", "230400", "115200"), width=12)
         self.baud_box.grid(row=1, column=1, sticky="w", padx=8)
         nano.columnconfigure(1, weight=1)
-        future = ttk.LabelFrame(panels, text="ESP32-CAM / USB", padding=10)
-        future.pack(side="left", fill="both", expand=True)
-        ttk.Label(future, text="Reserved for the second camera.\n"
-                  "Only OV7670 capture is implemented in this version.",
-                  wraplength=300).pack(anchor="w")
         buttons = ttk.Frame(main)
         buttons.pack(fill="x", pady=10)
         self.detect_button = ttk.Button(buttons, text="Detect connected camera", command=self.detect)
@@ -340,22 +374,41 @@ class CameraViewer:
         self.control_section = CollapsibleSection(main, "Control Panel")
         self.control_section.pack(fill="x", pady=(0, 10))
         boundaries = self.control_section.content
+        mode_row = ttk.Frame(boundaries)
+        mode_row.pack(fill="x", padx=6, pady=(0, 4))
+        self.light_filament_button = tk.Checkbutton(
+            mode_row, text="light filament mode", variable=self.light_filament_mode,
+            indicatoron=False, borderwidth=2, relief="raised", offrelief="raised",
+            selectcolor="#dbeafe", highlightthickness=1, highlightbackground="#64748b",
+            highlightcolor="#2563eb", padx=10, pady=3, command=self.redraw)
+        self.light_filament_button.pack(side="left")
+        ttk.Label(mode_row, text="Invert processed image; raw frame unchanged.").pack(side="left", padx=12)
+        illumination_row = ttk.Frame(boundaries)
+        illumination_row.pack(fill="x", padx=6, pady=(0, 4))
+        self.illumination_slider = tk.Scale(
+            illumination_row, label="LED Brightness - A6 [0-255] (variable)", variable=self.illumination,
+            from_=0, to=255, resolution=1, orient="horizontal", length=280,
+            fg="#c00000", state="disabled", command=self.illumination_changed)
+        self.illumination_slider.pack(side="left", fill="x", expand=True)
+        ttk.Label(illumination_row, textvariable=self.illumination_status,
+                  wraplength=650).pack(side="left", padx=12)
         slider_row = ttk.Frame(boundaries)
         slider_row.pack(fill="x")
         self.region_sliders = []
-        for index, (label, variable, lower, upper) in enumerate([
-            ("Region 1 x [px] (constant)", self.region_x1, 0, 317),
-            ("Region 2 x [px] (constant)", self.region_x2, 1, 318),
-            ("Region 3 x [px] (constant)", self.region_x3, 2, 319),
-            ("Region 4 x [px] (constant)", self.region_x4, 3, 320),
-        ]):
-            cell = ttk.Frame(slider_row)
-            cell.pack(side="left", fill="x", expand=True, padx=6)
-            slider = tk.Scale(cell, label=label, variable=variable, from_=lower, to=upper,
-                              resolution=1, orient="horizontal", showvalue=True,
-                              command=lambda value, which=index: self.region_changed(which, value))
-            slider.pack(fill="x")
-            self.region_sliders.append(slider)
+        for region, name in enumerate(("Left", "Middle", "Right")):
+            group = ttk.Frame(slider_row)
+            group.pack(side="left", fill="x", expand=True, padx=4)
+            for endpoint, label in enumerate((name + " start x (constant)", name + " end x (constant)")):
+                index = 2 * region + endpoint
+                cell = ttk.Frame(group)
+                cell.pack(side="left", fill="x", expand=True)
+                slider = tk.Scale(
+                    cell, label=label, variable=self.region_coordinates[index],
+                    from_=endpoint, to=319 + endpoint, resolution=1, orient="horizontal",
+                    showvalue=True, length=130,
+                    command=lambda value, which=index: self.region_changed(which, value))
+                slider.pack(fill="x")
+                self.region_sliders.append(slider)
         threshold_row = ttk.Frame(boundaries)
         threshold_row.pack(fill="x", padx=6, pady=(7, 3))
         ttk.Label(threshold_row, text="Gradient Threshold [0-255] (constant)").pack(side="left")
@@ -364,7 +417,7 @@ class CameraViewer:
         ttk.Label(threshold_row, text="Gradient Window [px] (constant)").pack(side="left", padx=(10, 0))
         self.window_size_entry = ttk.Entry(threshold_row, textvariable=self.gradient_window_size_input, width=8)
         self.window_size_entry.pack(side="left", padx=10)
-        ttk.Label(threshold_row, text="Search windows: x1-x2 | x2-x3 | x3-x4").pack(side="left", padx=15)
+        ttk.Label(threshold_row, text="Windows [px]: Left x1-x2 | Middle x3-x4 | Right x5-x6").pack(side="left", padx=15)
         geometry = ttk.Frame(boundaries)
         geometry.pack(fill="x", padx=6, pady=(7, 0))
         self.geometry_entries = {}
@@ -420,7 +473,7 @@ class CameraViewer:
         self.canvas.bind("<Configure>", self.redraw)
         self.processed_canvas.bind("<Configure>", self.redraw)
         ttk.Label(main, textvariable=self.frame_status).pack(anchor="w", pady=(8, 0))
-        ttk.Label(main, text="Blue: window limits and dividers. Red: per-row centerlines and paired gradient peaks."
+        ttk.Label(main, text="Blue: six independent window boundaries. Red: per-row centerlines and paired gradient peaks."
                   ).pack(anchor="w")
         diagnostics = ttk.LabelFrame(main, text="Diagnostics Panel", padding=10)
         diagnostics.pack(fill="x", pady=(8, 0))
@@ -452,20 +505,19 @@ class CameraViewer:
 
     def update_buttons(self):
         busy = self.worker is not None
-        supported = self.camera.get() == "OV7670"
         for button in (self.detect_button, self.connect_button):
-            button.config(state="normal" if supported and not busy else "disabled")
+            button.config(state="disabled" if busy else "normal")
         self.disconnect_button.config(state="normal" if busy else "disabled")
-        self.port_box.config(state="disabled" if busy or not supported else "readonly")
-        self.baud_box.config(state="disabled" if busy or not supported else "readonly")
+        self.port_box.config(state="disabled" if busy else "readonly")
+        self.baud_box.config(state="disabled" if busy else "readonly")
+        self.illumination_slider.config(
+            state="normal" if busy and self.illumination_supported else "disabled")
 
-    def camera_changed(self):
-        self.disconnect()
-        self.clear_frame()
-        self.identity.set("Sensor identity has not been read.")
-        self.status.set("Disconnected." if self.camera.get() == "OV7670"
-                        else "ESP32-CAM support will be added in the next stage.")
-        self.update_buttons()
+    def illumination_changed(self, value):
+        level = max(0, min(255, int(round(float(value)))))
+        if self.worker is not None and self.illumination_supported:
+            self.worker.set_illumination(level)
+            self.illumination_status.set(f"Requested {level}/255; applying between frames...")
 
     def clear_frame(self):
         self.processing_result = None
@@ -507,13 +559,16 @@ class CameraViewer:
                             "Other boards are not probed automatically.")
 
     def connect(self):
-        if self.worker is not None or self.camera.get() != "OV7670":
+        if self.worker is not None:
             return
         selected = self.ports.get(self.port.get())
         if selected is None:
             self.status.set("Detect USB ports first, then select the Nano ESP32.")
             return
         self.clear_frame()
+        self.illumination_supported = False
+        self.illumination.set(255)
+        self.illumination_status.set("Checking camera illumination support...")
         self.identity.set(f"USB board: {selected.device}; VID:PID "
                           f"{selected.vid:04X}:{selected.pid:04X}. Reading sensor identity...")
         self.status.set(f"Connecting to {selected.device}...")
@@ -524,6 +579,10 @@ class CameraViewer:
 
     def disconnect(self):
         self.accept_frames = False
+        self.illumination_supported = False
+        self.illumination.set(0)
+        self.illumination_status.set("Disconnected. LED is turned off when USB shutdown completes.")
+        self.update_buttons()
         if self.worker:
             self.worker.stop.set()
             self.status.set("Disconnecting...")
@@ -531,9 +590,10 @@ class CameraViewer:
 
     def region_changed(self, which, value):
         requested = int(round(float(value)))
-        lower = self.region_coordinates[which - 1].get() + 1 if which else 0
-        upper = (self.region_coordinates[which + 1].get() - 1
-                 if which < 3 else self.region_frame_width)
+        # Clamp only against the other endpoint of this window. Other views
+        # never move or constrain this pair; gaps and overlaps are allowed.
+        lower = 0 if which % 2 == 0 else self.region_coordinates[which - 1].get() + 1
+        upper = self.region_coordinates[which + 1].get() - 1 if which % 2 == 0 else self.region_frame_width
         coordinate = max(lower, min(requested, upper))
         if self.region_coordinates[which].get() != coordinate:
             self.region_coordinates[which].set(coordinate)
@@ -544,13 +604,14 @@ class CameraViewer:
             return
         ratio = width / self.region_frame_width
         coordinates = []
-        for index, variable in enumerate(self.region_coordinates):
-            lower = coordinates[-1] + 1 if index else 0
-            coordinates.append(max(lower, min(width - (3 - index), round(variable.get() * ratio))))
+        for index in range(0, 6, 2):
+            start = max(0, min(width - 1, round(self.region_coordinates[index].get() * ratio)))
+            end = max(start + 1, min(width, round(self.region_coordinates[index + 1].get() * ratio)))
+            coordinates.extend((start, end))
         self.region_frame_width = width
         for index, (slider, variable, coordinate) in enumerate(
                 zip(self.region_sliders, self.region_coordinates, coordinates)):
-            slider.configure(from_=index, to=width - (3 - index))
+            slider.configure(from_=index % 2, to=width - 1 + index % 2)
             variable.set(coordinate)
 
     def threshold_changed(self, *args):
@@ -613,12 +674,14 @@ class CameraViewer:
     def process_frame(self):
         key = (self.last_frame.sequence, self.last_frame.received_at,
                *(variable.get() for variable in self.region_coordinates),
-               self.gradient_threshold, self.gradient_window_size)
+               self.gradient_threshold, self.gradient_window_size, self.light_filament_mode.get())
         if key != self.processing_key:
-            self.processing_result = measure_filaments(
+            self.processing_result = measure_filament_windows(
                 self.last_frame.pixels, self.last_frame.width, self.last_frame.height,
-                *(variable.get() for variable in self.region_coordinates), self.gradient_threshold,
-                gradient_window_size=self.gradient_window_size)
+                tuple((self.region_coordinates[i].get(), self.region_coordinates[i + 1].get())
+                      for i in range(0, 6, 2)), self.gradient_threshold,
+                gradient_window_size=self.gradient_window_size,
+                light_filament_mode=self.light_filament_mode.get())
             self.processing_key = key
             self.processing_frame_sequence = self.last_frame.sequence
             for variable, mean in zip(self.mean_width_vars, self.processing_result.mean_widths_px):
@@ -757,10 +820,21 @@ class CameraViewer:
                                   f"sensor VER {version_text}")
                 self.status.set("Connected. Receiving grayscale frames..." if value["camera_ready"]
                                 else "USB board detected; camera initialization failed.")
+                self.illumination_supported = value.get("led_control") is True and value["camera_ready"]
+                self.illumination_status.set(
+                    "LED ready; starts HIGH. 0 = off, 255 = continuous 3.3 V HIGH."
+                    if self.illumination_supported else
+                    "LED control unavailable. Upload NanoOV7670USB firmware 1.3 or newer.")
+                self.update_buttons()
+            elif kind == "illumination":
+                self.illumination_status.set(
+                    f"Applied {value}/255 ({value / 255 * 100:.0f}%); A6 PWM, 3.3 V HIGH.")
             elif kind == "error":
                 self.status.set(value)
             elif kind == "stopped":
                 self.worker = None
+                self.illumination_supported = False
+                self.illumination_status.set("LED control disconnected; reconnect to enable it.")
                 if self.status.get() == "Disconnecting...":
                     self.status.set("Disconnected.")
                 self.update_buttons()
@@ -806,6 +880,11 @@ def main():
     parser.add_argument("--second-x", type=int, help="Initial second region boundary in source pixels.")
     parser.add_argument("--third-x", type=int, help="Initial third region boundary in source pixels.")
     parser.add_argument("--fourth-x", type=int, help="Initial fourth region boundary in source pixels.")
+    for view in ("left", "middle", "right"):
+        for endpoint in ("start", "end"):
+            parser.add_argument("--" + view + "-" + endpoint, type=int,
+                                help="Initial " + view + " window " + endpoint + " x coordinate.")
+    parser.add_argument("--light-filament-mode", action="store_true", help="Invert working pixels before edge detection.")
     parser.add_argument("--threshold", type=float, help="Initial gradient threshold (0-255).")
     parser.add_argument("--gradient-window-size", type=int, default=10, help="Vertical averaging window in pixels (default 10).")
     for option in ("focal-length", "sensor-width", "lens-offset", "filament-distance",
@@ -820,6 +899,15 @@ def main():
     fourth = args.fourth_x if args.fourth_x is not None else 320
     if not 0 <= first < second < third < fourth <= 320:
         parser.error("Initial boundaries must satisfy 0 <= x1 < x2 < x3 < x4 <= 320.")
+    coordinates = []
+    for index, view in enumerate(("left", "middle", "right")):
+        start = getattr(args, view + "_start")
+        end = getattr(args, view + "_end")
+        start = (first, second, third)[index] if start is None else start
+        end = (second, third, fourth)[index] if end is None else end
+        if not 0 <= start < end <= 320:
+            parser.error(view + " window must satisfy 0 <= start < end <= 320.")
+        coordinates.extend((start, end))
     if args.threshold is not None and (not math.isfinite(args.threshold) or not 0 <= args.threshold <= 255):
         parser.error("Threshold must be a finite number from 0 to 255.")
     if args.list_ports:
@@ -834,10 +922,9 @@ def main():
         return
     root = tk.Tk()
     app = CameraViewer(root)
-    app.region_x1.set(first)
-    app.region_x2.set(second)
-    app.region_x3.set(third)
-    app.region_x4.set(fourth)
+    for variable, value in zip(app.region_coordinates, coordinates):
+        variable.set(value)
+    app.light_filament_mode.set(args.light_filament_mode)
     if args.threshold is not None:
         app.gradient_threshold_input.set(f"{args.threshold:g}")
     app.gradient_window_size_input.set(str(args.gradient_window_size))

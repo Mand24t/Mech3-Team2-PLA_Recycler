@@ -1,6 +1,8 @@
 """Ground-truth checks for three-window gradient-based pixel measurements."""
 import unittest
-from filament_processing import measure_filaments, vertical_average
+from unittest import mock
+import filament_processing
+from filament_processing import measure_filaments, measure_filament_windows, vertical_average
 
 
 def scene(rows):
@@ -16,6 +18,61 @@ def scene(rows):
 
 
 class FilamentProcessingTests(unittest.TestCase):
+    def test_independent_windows_ignore_noise_in_gaps(self):
+        pixels = bytearray(scene([(10, 8, 12)]))
+        pixels[28:35] = bytes(7)
+        pixels[58:65] = bytes(7)
+        bounds = ((6, 26), (36, 56), (66, 86))
+        result = measure_filament_windows(bytes(pixels), 90, 1, bounds)
+        self.assertEqual(result.window_bounds, bounds)
+        self.assertEqual(result.widths_px, ((10, 8, 12),))
+        for x in (*range(26, 36), *range(56, 66)):
+            self.assertEqual(result.gradient_mask[x], 0)
+            self.assertEqual(result.filament_mask[x], 0)
+            self.assertEqual(result.processed_rgb[3*x:3*x+3], bytes([pixels[x]]) * 3)
+
+    def test_clipping_one_window_does_not_change_other_windows(self):
+        result = measure_filament_windows(scene([(10, 8, 12)]), 90, 1,
+                                          ((6, 19), (36, 56), (66, 86)))
+        self.assertEqual(result.widths_px, ((None, 8, 12),))
+        self.assertEqual(result.right_boundary_x[0][1:], (49, 81))
+
+    def test_windows_are_not_sorted_or_clamped_against_each_other(self):
+        pixels = scene([(10, 8, 12)])
+        result = measure_filament_windows(pixels, 90, 1, ((30, 60), (0, 30), (60, 90)))
+        self.assertEqual(result.widths_px, ((8, 10, 12),))
+        overlap = measure_filament_windows(pixels, 90, 1, ((0, 30), (0, 30), (60, 90)))
+        self.assertEqual(overlap.widths_px, ((10, 10, 12),))
+
+    def test_independent_windows_validate_each_pair(self):
+        for bounds in (((0, 30), (30, 60)), ((0, 30), (30, 60), (60, 91)),
+                       ((10, 10), (30, 60), (60, 90)), ((True, 30), (30, 60), (60, 90))):
+            with self.subTest(bounds=bounds), self.assertRaises(ValueError):
+                measure_filament_windows(scene([(10, 8, 12)]), 90, 1, bounds)
+
+    def test_light_mode_inverts_every_grayscale_value_and_preserves_source(self):
+        pixels = bytes(range(256))
+        result = measure_filaments(pixels, 256, 1, 0, 85, 170, 256,
+                                   gradient_threshold=255, light_filament_mode=True)
+        self.assertEqual(pixels, bytes(range(256)))
+        expected = bytes(value for gray in reversed(range(256)) for value in (gray, gray, gray))
+        self.assertEqual(result.processed_rgb, expected)
+        self.assertTrue(result.light_filament_mode)
+
+    def test_light_mode_precedes_averaging_search_and_red_overlays(self):
+        pixels = bytes(220 - value for value in scene([(10, 8, 12)] * 4))
+        inverted = bytes(255 - value for value in pixels)
+        with mock.patch.object(filament_processing, 'vertical_average', wraps=vertical_average) as averaging:
+            result = measure_filaments(pixels, 90, 4, 0, 30, 60, 90, light_filament_mode=True)
+        self.assertEqual(averaging.call_args.args[0], inverted)
+        reference = measure_filaments(inverted, 90, 4, 0, 30, 60, 90)
+        self.assertEqual(result.processed_rgb, reference.processed_rgb)
+        self.assertEqual(result.gradient_mask, reference.gradient_mask)
+        self.assertEqual(result.widths_px, ((10, 8, 12),) * 4)
+        for y in range(4):
+            row = result.processed_rgb[y * 90 * 3:(y + 1) * 90 * 3]
+            self.assertEqual(sum(row[x:x+3] == b'\xff\x00\x00' for x in range(0, len(row), 3)), 9)
+
     def test_known_rectangles_return_boundary_distances_for_each_row(self):
         pixels = scene([(10, 8, 12)] * 4)
         result = measure_filaments(pixels, 90, 4, 0, 30, 60, 90, 20)

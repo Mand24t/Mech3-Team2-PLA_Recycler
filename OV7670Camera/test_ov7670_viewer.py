@@ -59,6 +59,9 @@ class FakeUSB:
                 self.incoming.extend(packet(sequence=self.frame_count))
                 if self.on_frame:
                     self.on_frame(self.frame_count)
+            elif data.startswith(b"OV7670_LED "):
+                value = int(data.split()[1])
+                self.incoming.extend(b'OV7670_LED ' + json.dumps({"value": value}).encode() + b'\n')
         return len(data)
 
     def read(self, count):
@@ -71,6 +74,25 @@ class FakeUSB:
 class ProtocolTests(unittest.TestCase):
     def protocol(self, data=b"", **kwargs):
         return viewer.CameraProtocol(FakeUSB(data, **kwargs), threading.Event())
+
+    def test_led_acknowledgement_preserves_following_frame(self):
+        protocol = self.protocol(b'OV7670_LED {"value":255}\n' + packet())
+        protocol.set_illumination(255)
+        self.assertEqual(protocol.request_frame().sequence, 1)
+        self.assertEqual(protocol.stream.writes, [b'OV7670_LED 255\n', b'OV7670_FRAME\n'])
+
+    def test_invalid_led_values_never_write_to_usb(self):
+        protocol = self.protocol()
+        for value in (-1, 256, True, 1.5, "128"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                protocol.set_illumination(value)
+        self.assertEqual(protocol.stream.writes, [])
+
+    def test_led_mismatch_malformed_reply_and_device_error_are_rejected(self):
+        for reply in (b'OV7670_LED {"value":2}\n', b'OV7670_LED invalid\n',
+                      b'OV7670_LED {"value":true}\n', b'OV7670_ERROR PWM unavailable\n'):
+            with self.subTest(reply=reply), self.assertRaises(viewer.CameraError):
+                self.protocol(reply).set_illumination(1)
 
     def test_identifies_sensor_after_boot_messages_and_fragmented_reply(self):
         payload = b"ESP32 boot log\r\n" + viewer.INFO_PREFIX + json.dumps(identity()).encode() + b"\n"
@@ -148,6 +170,30 @@ class ProtocolTests(unittest.TestCase):
 
 
 class DiscoveryAndWorkerTests(unittest.TestCase):
+    def test_worker_applies_latest_led_value_between_frames_and_turns_off_on_exit(self):
+        events, frames = queue.Queue(), queue.Queue(maxsize=1)
+        worker = viewer.CameraWorker("TEST", viewer.BAUD, events, frames)
+        stream = FakeUSB(info=identity(led_control=True), automatic=True)
+        def change_light(number):
+            if number == 1:
+                worker.set_illumination(128)
+            elif number == 2:
+                worker.set_illumination(64)
+                worker.set_illumination(200)
+            elif number == 3:
+                worker.stop.set()
+        stream.on_frame = change_light
+        with mock.patch.object(viewer.serial, "Serial", return_value=stream):
+            worker.start()
+            worker.join(timeout=3)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(stream.closed)
+        self.assertEqual([data for data in stream.writes if data.startswith(b'OV7670_LED ')],
+                         [b'OV7670_LED 255\n', b'OV7670_LED 128\n', b'OV7670_LED 200\n', b'OV7670_LED 0\n'])
+        kinds = [events.get_nowait()[0] for _ in range(events.qsize())]
+        self.assertNotIn("error", kinds)
+        self.assertEqual(kinds.count("illumination"), 3)
+
     def test_detection_excludes_bluetooth_and_keeps_usb(self):
         bluetooth = SimpleNamespace(device="COM5", vid=None)
         nano = SimpleNamespace(device="COM8", vid=0x2341)
@@ -193,11 +239,70 @@ class DiscoveryAndWorkerTests(unittest.TestCase):
 
 
 class WindowTests(unittest.TestCase):
+    def test_six_window_sliders_are_independent_and_scale_as_pairs(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = viewer.CameraViewer(root)
+            self.assertEqual(len(app.region_sliders), 6)
+            original = [variable.get() for variable in app.region_coordinates]
+            app.region_changed(1, '200')
+            self.assertEqual(app.region_x2.get(), 200)
+            self.assertEqual([variable.get() for variable in app.region_coordinates[2:]], original[2:])
+            app.region_changed(0, '250')
+            self.assertEqual(app.region_x1.get(), 199)
+            self.assertEqual(app.region_x2.get(), 200)
+            app.sync_region_width(160)
+            for index in range(0, 6, 2):
+                self.assertTrue(0 <= app.region_coordinates[index].get()
+                                < app.region_coordinates[index + 1].get() <= 160)
+            app.last_frame = viewer.Frame(1, 160, 120, bytes(160 * 120), time.monotonic())
+            app.redraw()
+            lines = app.processed_canvas.find_withtag('region_boundary')
+            self.assertEqual(len(lines), 6)
+            self.assertTrue(all(app.processed_canvas.itemcget(line, 'fill') == '#0000ff' for line in lines))
+            expected = tuple((app.region_coordinates[i].get(), app.region_coordinates[i+1].get())
+                             for i in range(0, 6, 2))
+            self.assertEqual(app.processing_result.window_bounds, expected)
+        finally:
+            for timer in root.tk.call('after', 'info'):
+                root.after_cancel(timer)
+            root.destroy()
+
+    def test_light_mode_toggle_reprocesses_current_frame_and_preserves_raw_preview(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = viewer.CameraViewer(root)
+            pixels = bytes(240 if any(a <= x < b for a, b in ((30, 50), (120, 140), (230, 250)))
+                           else 0 for y in range(12) for x in range(320))
+            frame = viewer.Frame(8, 320, 12, pixels, time.monotonic())
+            app.last_frame = frame
+            app.redraw()
+            original_result = app.processing_result
+            self.assertFalse(app.light_filament_mode.get())
+            app.light_filament_button.invoke()
+            self.assertTrue(app.light_filament_mode.get())
+            self.assertTrue(app.processing_result.light_filament_mode)
+            self.assertIsNot(app.processing_result, original_result)
+            self.assertIs(app.last_frame, frame)
+            self.assertEqual(app.last_frame.pixels, pixels)
+            self.assertEqual(app.photo.get(0, 0), (0, 0, 0))
+            self.assertEqual(app.processed_photo.get(0, 0), (255, 255, 255))
+            app.light_filament_button.invoke()
+            self.assertFalse(app.light_filament_mode.get())
+            self.assertEqual(app.processing_result.processed_rgb, original_result.processed_rgb)
+        finally:
+            for timer in root.tk.call('after', 'info'):
+                root.after_cancel(timer)
+            root.destroy()
+
     def test_geometry_defaults_and_single_press_calibration(self):
         root = tk.Tk()
         root.withdraw()
         try:
             app = viewer.CameraViewer(root)
+            self.assertEqual(app.illumination.get(), 255)
             self.assertEqual(app.geometry_inputs["focal_length"].get(), "3.37")
             self.assertEqual(app.geometry_inputs["sensor_width"].get(), "2.304")
             self.assertEqual(app.geometry_inputs["lens_offset"].get(), "3.4")
@@ -234,7 +339,7 @@ class WindowTests(unittest.TestCase):
                 root.after_cancel(timer)
             root.destroy()
 
-    def test_grayscale_rendering_detection_and_camera_selector(self):
+    def test_grayscale_rendering_detection_and_connection_controls(self):
         root = tk.Tk()
         root.withdraw()
         try:
@@ -249,13 +354,18 @@ class WindowTests(unittest.TestCase):
             with mock.patch.object(viewer, "usb_ports", return_value=[]):
                 app.detect()
             self.assertIn("No USB serial", app.status.get())
-            app.camera.set("ESP32-CAM")
-            app.camera_changed()
+            app.worker = object()
+            app.update_buttons()
             self.assertEqual(str(app.detect_button["state"]), "disabled")
+            self.assertEqual(str(app.port_box["state"]), "disabled")
+            self.assertEqual(str(app.disconnect_button["state"]), "normal")
+            app.worker = None
+            app.update_buttons()
+            app.clear_frame()
             self.assertIsNone(app.last_frame)
-            app.camera.set("OV7670")
-            app.camera_changed()
             self.assertEqual(str(app.detect_button["state"]), "normal")
+            self.assertEqual(str(app.port_box["state"]), "readonly")
+            self.assertEqual(str(app.disconnect_button["state"]), "disabled")
         finally:
             for timer in root.tk.call("after", "info"):
                 root.after_cancel(timer)
