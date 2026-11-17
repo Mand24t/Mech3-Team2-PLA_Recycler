@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from array import array
 from collections.abc import Sequence
 import math
+from transparent_filament import track_transparent_edges, background_difference_tracks
+from polynomial_boundaries import fit_deviation_boundaries
 
 INVERT_GRAYSCALE = bytes(range(255, -1, -1))
 
@@ -26,18 +28,22 @@ class FilamentMeasurement:
     window_bounds: tuple[tuple[int, int], ...]
     center_x: tuple[float | None, ...]  # Mean of valid row centerlines, by view.
     centerline_x: tuple[tuple[float | None, ...], ...]  # [y][view]
-    left_boundary_x: tuple[tuple[int | None, ...], ...]
-    right_boundary_x: tuple[tuple[int | None, ...], ...]
-    widths_px: tuple[tuple[int | None, ...], ...]  # [y][left, middle, right]
+    left_boundary_x: tuple[tuple[float | None, ...], ...]
+    right_boundary_x: tuple[tuple[float | None, ...], ...]
+    widths_px: tuple[tuple[float | None, ...], ...]  # [y][left, middle, right]
     mean_widths_px: tuple[float | None, ...]
     valid_rows: tuple[int, ...]
     gradient_threshold: float
     gradient_window_size: int
     gradient_window_rows: tuple[int, ...]  # Actual row count after clipping, indexed by y.
     light_filament_mode: bool
-    gradient_mask: bytes  # 255 where an in-window adjacent-pixel gradient exceeds threshold.
+    gradient_mask: bytes  # Gradient mask; full-frame raw deviation mask in transparent-reference mode.
     filament_mask: bytes  # 255 in each valid row interval [left, right); zero elsewhere.
     processed_rgb: bytes
+    transparent_filament_mode: bool = False
+    transparent_status: tuple[str, ...] = ()
+    polynomial_order: int | None = None
+    curve_sample_rows: tuple[int, ...] = ()
 
     def ppm(self) -> bytes:
         return f"P6\n{self.width} {self.height}\n255\n".encode("ascii") + self.processed_rgb
@@ -172,7 +178,11 @@ def measure_filament_windows(pixels: bytes, width: int, height: int,
                              window_bounds: Sequence[tuple[int, int]],
                              gradient_threshold: float = 20,
                              gradient_window_size: int = 10,
-                             light_filament_mode: bool = False) -> FilamentMeasurement:
+                             light_filament_mode: bool = False,
+                             transparent_filament_mode: bool = False,
+                             transparent_background: Sequence[float] | None = None,
+                             require_transparent_background: bool = False,
+                             polynomial_order: int | None = None) -> FilamentMeasurement:
     if type(width) is not int or type(height) is not int or width < 3 or height < 1:
         raise ValueError("Image dimensions must be positive integers; width must be at least 3.")
     if len(pixels) != width * height:
@@ -191,6 +201,8 @@ def measure_filament_windows(pixels: bytes, width: int, height: int,
         raise ValueError("Gradient threshold must be between 0 and 255.")
     if type(light_filament_mode) is not bool:
         raise ValueError("Light filament mode must be True or False.")
+    if type(transparent_filament_mode) is not bool:
+        raise ValueError("Transparent filament mode must be True or False.")
     # Invert a working copy before smoothing or searching; camera bytes remain
     # untouched for the raw preview. Overlays are added after inversion.
     working_pixels = pixels.translate(INVERT_GRAYSCALE) if light_filament_mode else pixels
@@ -201,6 +213,35 @@ def measure_filament_windows(pixels: bytes, width: int, height: int,
     rgb[2::3] = working_pixels
     gradient_mask = bytearray(width * height)
     filament_mask = bytearray(width * height)
+    transparent_tracks, transparent_status = [], []
+    curve_sample_rows = ()
+    if polynomial_order is not None and (type(polynomial_order) is not int or not 0 <= polynomial_order <= 8):
+        raise ValueError("Polynomial order must be a whole number from 0 to 8.")
+    if transparent_filament_mode:
+        if transparent_background is not None:
+            if len(transparent_background) != width*height:
+                raise ValueError("Background reference dimensions do not match the frame.")
+            if polynomial_order is not None:
+                gradient_mask[:] = bytes(255 if abs(value-background) > threshold else 0
+                                         for value, background in zip(pixels, transparent_background))
+                transparent_tracks, transparent_status, curve_sample_rows = fit_deviation_boundaries(
+                    gradient_mask, width, height, bounds, polynomial_order)
+            else:
+                # Retain the prior tracker for callers not requesting curve fits.
+                original_average, _ = vertical_average(pixels, width, height, gradient_window_size)
+                reference_average, _ = vertical_average(transparent_background, width, height, gradient_window_size)
+                transparent_tracks, transparent_status = background_difference_tracks(
+                    original_average, reference_average, width, height, bounds, threshold, gradient_mask)
+        elif require_transparent_background:
+            transparent_tracks = [[(None, None)]*height for _ in bounds]
+            transparent_status = ["remove filament, then Capture Background"]*3
+        else:
+            # Compatibility for offline rim-tracker experiments. The GUI now
+            # requires a reference rather than treating these guesses as data.
+            for start, end in bounds:
+                track, status = track_transparent_edges(averaged, width, height, start, end, threshold, gradient_mask)
+                transparent_tracks.append(track)
+                transparent_status.append(status)
     left_rows, right_rows, center_rows, widths = [], [], [], []
     totals, center_totals, counts = [0, 0, 0], [0.0, 0.0, 0.0], [0, 0, 0]
 
@@ -212,16 +253,19 @@ def measure_filament_windows(pixels: bytes, width: int, height: int,
         offset = y * width
         row_left, row_right, row_centers, row_widths = [], [], [], []
         for region, (start, end) in enumerate(bounds):
-            left, right = slice_edges(averaged, offset, start, end, threshold, gradient_mask)
+            left, right = (transparent_tracks[region][y] if transparent_filament_mode else
+                           slice_edges(averaged, offset, start, end, threshold, gradient_mask))
             measured = center = None
             if left is not None and right is not None:
                 measured = right - left
                 center = (left + right) / 2.0
-                filament_mask[offset + left:offset + right] = bytes([255]) * measured
+                fill_left, fill_right = max(start, math.ceil(left)), min(end, math.ceil(right))
+                filament_mask[offset+fill_left:offset+fill_right] = bytes([255])*(fill_right-fill_left)
                 center_pixel = max(left + 1, min(right - 1, math.floor(center + 0.5)))
-                mark(left, y)
-                mark(center_pixel, y)
-                mark(right, y)
+                if not (transparent_filament_mode and transparent_background is not None):
+                    mark(left, y)
+                    mark(center_pixel, y)
+                    mark(right, y)
                 totals[region] += measured
                 center_totals[region] += center
                 counts[region] += 1
@@ -233,6 +277,32 @@ def measure_filament_windows(pixels: bytes, width: int, height: int,
         right_rows.append(tuple(row_right))
         center_rows.append(tuple(row_centers))
         widths.append(tuple(row_widths))
+
+    if transparent_filament_mode and transparent_background is not None:
+        # Preview every raw pixel difference, including outside measurement ROIs.
+        # Diameter tracking above uses averaged data, never this colored overlay.
+        gradient_mask[:] = bytes(255 if abs(value-background) > threshold else 0
+                                 for value, background in zip(pixels, transparent_background))
+        for index, changed in enumerate(gradient_mask):
+            if changed:
+                rgb[index*3:index*3+3] = b"\xff\x00\x00"
+
+    if transparent_filament_mode and transparent_background is not None and polynomial_order is not None:
+        # Connect adjacent rounded curve points so steep portions stay continuous.
+        for region, (start, end) in enumerate(bounds):
+            previous = [None, None]
+            for y, pairs in enumerate(transparent_tracks[region]):
+                for side, value in enumerate(pairs):
+                    if value is None:
+                        previous[side] = None
+                        continue
+                    x = max(start, min(end-1, math.floor(value+.5)))
+                    old_x = previous[side]
+                    for draw_x in range(min(x, old_x if old_x is not None else x),
+                                        max(x, old_x if old_x is not None else x)+1):
+                        index = (y*width+draw_x)*3
+                        rgb[index:index+3] = b"\xff\xff\x00"
+                    previous[side] = x
 
     return FilamentMeasurement(
         width=width, height=height, window_bounds=bounds,
@@ -246,14 +316,20 @@ def measure_filament_windows(pixels: bytes, width: int, height: int,
         gradient_window_size=gradient_window_size, gradient_window_rows=window_rows,
         light_filament_mode=light_filament_mode,
         gradient_mask=bytes(gradient_mask), filament_mask=bytes(filament_mask),
-        processed_rgb=bytes(rgb))
+        processed_rgb=bytes(rgb), transparent_filament_mode=transparent_filament_mode,
+        transparent_status=tuple(transparent_status), polynomial_order=polynomial_order,
+        curve_sample_rows=curve_sample_rows)
 
 
 def measure_filaments(pixels: bytes, width: int, height: int,
                       first_x: int, second_x: int, third_x: int, fourth_x: int,
                       gradient_threshold: float = 20,
                       gradient_window_size: int = 10,
-                      light_filament_mode: bool = False) -> FilamentMeasurement:
+                      light_filament_mode: bool = False,
+                             transparent_filament_mode: bool = False,
+                             transparent_background: Sequence[float] | None = None,
+                             require_transparent_background: bool = False,
+                             polynomial_order: int | None = None) -> FilamentMeasurement:
     """Compatibility interface for the former four shared boundaries."""
     coordinates = (first_x, second_x, third_x, fourth_x)
     if (any(type(value) is not int for value in coordinates)
@@ -261,4 +337,5 @@ def measure_filaments(pixels: bytes, width: int, height: int,
         raise ValueError("Region coordinates must satisfy 0 <= x1 < x2 < x3 < x4 <= image width.")
     return measure_filament_windows(
         pixels, width, height, tuple(zip(coordinates, coordinates[1:])),
-        gradient_threshold, gradient_window_size, light_filament_mode)
+        gradient_threshold, gradient_window_size, light_filament_mode, transparent_filament_mode,
+        transparent_background, require_transparent_background, polynomial_order)

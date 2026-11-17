@@ -18,7 +18,11 @@ import tkinter as tk
 from tkinter import ttk
 
 from filament_processing import measure_filament_windows
+from background_capture import BackgroundCapture
 from diameter_geometry import diameter_scales, mean_diameter
+from measurement_link import MeasurementPublisher, ADDRESS
+from viewer_settings import SETTINGS_PATH, load_settings, save_settings, validate_settings, CONFIGURATION_REQUEST_PATH, CONFIGURATION_RESULT_PATH, write_json
+from gui_components import CollapsibleSection, TITLE_FONT, configure_styles, configure_app_identity, add_tooltip
 
 try:
     import serial
@@ -205,6 +209,7 @@ class CameraWorker(threading.Thread):
         self.baud = baud
         self.events = events
         self.frames = frames
+        self.background_frames = None
         self.stop = threading.Event()
         self.illumination_lock = threading.Lock()
         self.illumination_value = 255
@@ -244,7 +249,11 @@ class CameraWorker(threading.Thread):
                     protocol.set_illumination(desired_illumination)
                     applied_illumination = desired_illumination
                     self.events.put(("illumination", applied_illumination))
-                put_latest(self.frames, protocol.request_frame())
+                frame = protocol.request_frame()
+                capture_queue = self.background_frames
+                if capture_queue is not None:
+                    capture_queue.put(frame)
+                put_latest(self.frames, frame)
         except (CameraError, OSError, ValueError) as error:
             if not self.stop.is_set():
                 self.events.put(("error", str(error)))
@@ -269,34 +278,32 @@ class CameraWorker(threading.Thread):
             self.events.put(("stopped", None))
 
 
-class CollapsibleSection(ttk.Frame):
-    """Hide the contents without destroying widgets or changing their values."""
-    def __init__(self, parent, title):
-        super().__init__(parent)
-        self.title = title
-        self.expanded = True
-        self.toggle_button = ttk.Button(self, text="- " + title,
-                                        style="Section.TButton", command=self.toggle)
-        self.toggle_button.pack(fill="x")
-        self.content = ttk.Frame(self, padding=7)
-        self.content.pack(fill="x")
-
-    def toggle(self):
-        self.expanded = not self.expanded
-        if self.expanded:
-            self.content.pack(fill="x")
-        else:
-            self.content.pack_forget()
-        self.toggle_button.configure(text=("- " if self.expanded else "+ ") + self.title)
-
-
 class CameraViewer:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, measurement_publisher=None):
         self.root = root
+        self.measurement_publisher = measurement_publisher
+        self.settings_path = None
+        self.saved_settings = None
+        self.pending_settings = None
+        self.settings_changed_at = 0
+        self.settings_status = tk.StringVar(value="")
+        self.configuration_request_path = CONFIGURATION_REQUEST_PATH
+        self.configuration_result_path = CONFIGURATION_RESULT_PATH
+        self.configuration_checked_at = 0.0
+        self.configuration_request_id = None
+        try:
+            if self.configuration_result_path.exists():
+                self.configuration_request_id = json.loads(self.configuration_result_path.read_text(encoding="utf-8")).get("id")
+        except (OSError, ValueError, AttributeError):
+            pass
         self.worker = None
         self.events = queue.Queue()
         self.frames = queue.Queue(maxsize=1)
         self.ports = {}
+        self.transparent_background = None
+        self.background_capture = None
+        self.background_frames = queue.Queue()
+        self.background_revision = 0
         self.last_frame = None
         self.photo = None
         self.processed_photo = None
@@ -304,6 +311,8 @@ class CameraViewer:
         self.region_frame_width = 320
         self.gradient_threshold = 20.0
         self.gradient_window_size = 10
+        self.polynomial_order = 3
+        self.polynomial_error = ""
         self.window_size_error = ""
         self.threshold_error = ""
         self.processing_result = None
@@ -315,11 +324,12 @@ class CameraViewer:
         self.accept_frames = False
         root.title("OV7670 | USB Camera Viewer")
         root.geometry(f"1200x{min(1080, root.winfo_screenheight() - 70)}")
-        root.minsize(1000, 900)
+        root.minsize(min(1000, max(360, root.winfo_screenwidth()//2-32)),
+                     min(900, max(360, root.winfo_screenheight()-100)))
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.port = tk.StringVar()
         self.baud = tk.StringVar(value=str(BAUD))
-        self.status = tk.StringVar(value="Disconnected. Connect the Nano by USB, then detect the camera.")
+        self.status = tk.StringVar(value="Connect the Nano by USB, then Refresh and Connect.")
         self.identity = tk.StringVar(value="Sensor identity has not been read.")
         self.frame_status = tk.StringVar(value="No frame received.")
         self.region_coordinates = [tk.IntVar(value=value) for value in (20, 106, 106, 213, 213, 320)]
@@ -328,6 +338,8 @@ class CameraViewer:
         self.gradient_threshold_input = tk.StringVar(value="20")
         self.gradient_window_size_input = tk.StringVar(value="10")
         self.light_filament_mode = tk.BooleanVar(value=False)
+        self.transparent_filament_mode = tk.BooleanVar(value=False)
+        self.polynomial_order_input = tk.StringVar(value="3")
         self.processing_status = tk.StringVar(value="Waiting for a camera frame.")
         self.mean_width_vars = [tk.StringVar(value="N/A") for _ in range(3)]
         self.instantaneous_diameter = tk.StringVar(value="")
@@ -337,38 +349,39 @@ class CameraViewer:
             ("mirror_distance", ""), ("correction", "1.0"))}
         self.true_diameter = tk.StringVar(value="")
         self.direct_view = tk.StringVar(value="Middle")
-        self.geometry_status = tk.StringVar(value="Enter installation distances to calculate diameter.")
+        self.geometry_status = tk.StringVar(value="Enter distances to calculate diameter.")
         self.calibration_status = tk.StringVar(value="")
         self.base_diameter = None
         self.geometry_scales = None
         self.illumination = tk.IntVar(value=255)
         self.illumination_supported = False
-        self.illumination_status = tk.StringVar(value="Connect LED-capable camera firmware to enable illumination.")
+        self.illumination_status = tk.StringVar(value="Connect the camera to enable LED control.")
         main = ttk.Frame(root, padding=14)
         main.pack(fill="both", expand=True)
-        ttk.Label(main, text="USB CAMERA VIEWER", font=("Segoe UI", 17, "bold")).pack(anchor="w")
-        style = ttk.Style(root)
-        style.configure("Section.TButton", anchor="w", font=("Segoe UI", 10, "bold"))
-        self.connection_section = CollapsibleSection(main, "Nano ESP32 + OV7670 / USB Connection")
+        ttk.Label(main, text="USB CAMERA VIEWER", font=TITLE_FONT).pack(anchor="w")
+        configure_styles(root)
+        self.connection_section = CollapsibleSection(main, "Connection")
         self.connection_section.pack(fill="x", pady=(8, 0))
-        nano = ttk.Frame(self.connection_section.content, padding=10)
+        nano = ttk.Frame(self.connection_section.content)
         nano.pack(fill="x")
-        ttk.Label(nano, text="USB serial port").grid(row=0, column=0, sticky="w")
-        self.port_box = ttk.Combobox(nano, textvariable=self.port, state="readonly", width=35)
-        self.port_box.grid(row=0, column=1, sticky="ew", padx=8)
-        ttk.Label(nano, text="Baud rate").grid(row=1, column=0, sticky="w", pady=6)
-        self.baud_box = ttk.Combobox(nano, textvariable=self.baud, state="readonly",
+        connection_row = ttk.Frame(nano)
+        connection_row.pack(fill="x")
+        ttk.Label(connection_row, text="Nano ESP32 USB port").pack(side="left", padx=(0, 8))
+        self.port_box = ttk.Combobox(connection_row, textvariable=self.port, state="readonly", width=28)
+        self.port_box.pack(side="left", fill="x", expand=True)
+        self.detect_button = ttk.Button(connection_row, text="Refresh", command=lambda: self.detect(auto_connect=False))
+        self.refresh_button = self.detect_button
+        self.detect_button.pack(side="left", padx=4)
+        self.connect_button = ttk.Button(connection_row, text="Connect", command=self.connect)
+        self.connect_button.pack(side="left", padx=4)
+        self.disconnect_button = ttk.Button(connection_row, text="Disconnect", command=self.disconnect)
+        self.disconnect_button.pack(side="left", padx=4)
+        baud_row = ttk.Frame(nano)
+        baud_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(baud_row, text="Baud rate").pack(side="left", padx=(0, 8))
+        self.baud_box = ttk.Combobox(baud_row, textvariable=self.baud, state="readonly",
                                      values=("921600", "460800", "230400", "115200"), width=12)
-        self.baud_box.grid(row=1, column=1, sticky="w", padx=8)
-        nano.columnconfigure(1, weight=1)
-        buttons = ttk.Frame(main)
-        buttons.pack(fill="x", pady=10)
-        self.detect_button = ttk.Button(buttons, text="Detect connected camera", command=self.detect)
-        self.detect_button.pack(side="left")
-        self.connect_button = ttk.Button(buttons, text="Connect selected port", command=self.connect)
-        self.connect_button.pack(side="left", padx=8)
-        self.disconnect_button = ttk.Button(buttons, text="Disconnect", command=self.disconnect)
-        self.disconnect_button.pack(side="left")
+        self.baud_box.pack(side="left")
         ttk.Label(main, textvariable=self.status, wraplength=990).pack(fill="x", anchor="w")
         ttk.Label(main, textvariable=self.identity, wraplength=990).pack(fill="x", anchor="w", pady=(3, 8))
         self.control_section = CollapsibleSection(main, "Control Panel")
@@ -377,28 +390,46 @@ class CameraViewer:
         mode_row = ttk.Frame(boundaries)
         mode_row.pack(fill="x", padx=6, pady=(0, 4))
         self.light_filament_button = tk.Checkbutton(
-            mode_row, text="light filament mode", variable=self.light_filament_mode,
+            mode_row, text="Light filament mode", variable=self.light_filament_mode,
             indicatoron=False, borderwidth=2, relief="raised", offrelief="raised",
             selectcolor="#dbeafe", highlightthickness=1, highlightbackground="#64748b",
             highlightcolor="#2563eb", padx=10, pady=3, command=self.redraw)
         self.light_filament_button.pack(side="left")
-        ttk.Label(mode_row, text="Invert processed image; raw frame unchanged.").pack(side="left", padx=12)
+        self.transparent_filament_button = tk.Checkbutton(
+            mode_row, text="Transparent Filament", variable=self.transparent_filament_mode,
+            indicatoron=False, borderwidth=2, relief="raised", offrelief="raised",
+            selectcolor="#dbeafe", highlightthickness=1, highlightbackground="#64748b",
+            highlightcolor="#2563eb", padx=10, pady=3, command=self.redraw)
+        self.transparent_filament_button.pack(side="left", padx=(8, 0))
+        self.capture_background_button = ttk.Button(mode_row, text="Capture Background", command=self.capture_transparent_background)
+        self.capture_background_button.pack(side="left", padx=(8, 0))
+        add_tooltip(self.capture_background_button, "Remove filament and keep the scene fixed for five seconds while frames are averaged. Reinsert only after capture completes.")
+        polynomial_row = ttk.Frame(boundaries)
+        polynomial_row.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(polynomial_row, text="Polynomial Fit Order [0-8]").pack(side="left")
+        self.polynomial_order_entry = ttk.Entry(polynomial_row, textvariable=self.polynomial_order_input, width=8)
+        self.polynomial_order_entry.pack(side="left", padx=8)
+        add_tooltip(self.polynomial_order_entry, "Fit x as a polynomial of image row for each outer red boundary. Higher orders bend more. Default 3; applies in Transparent Filament mode.")
+        self.background_status = tk.StringVar(value="Transparent: remove filament, Capture Background, then reinsert.")
+        ttk.Label(boundaries, textvariable=self.background_status, wraplength=900).pack(anchor="w", padx=6, pady=(0, 4))
         illumination_row = ttk.Frame(boundaries)
         illumination_row.pack(fill="x", padx=6, pady=(0, 4))
         self.illumination_slider = tk.Scale(
-            illumination_row, label="LED Brightness - A6 [0-255] (variable)", variable=self.illumination,
+            illumination_row, label="LED brightness [0-255]", variable=self.illumination,
             from_=0, to=255, resolution=1, orient="horizontal", length=280,
-            fg="#c00000", state="disabled", command=self.illumination_changed)
+            fg="black", state="disabled", command=self.illumination_changed)
         self.illumination_slider.pack(side="left", fill="x", expand=True)
         ttk.Label(illumination_row, textvariable=self.illumination_status,
                   wraplength=650).pack(side="left", padx=12)
+        self.filament_bounds_title = ttk.Label(boundaries, text="Filament Bounds", font=("Segoe UI", 10, "bold"))
+        self.filament_bounds_title.pack(anchor="w", padx=6, pady=(6, 2))
         slider_row = ttk.Frame(boundaries)
         slider_row.pack(fill="x")
         self.region_sliders = []
         for region, name in enumerate(("Left", "Middle", "Right")):
             group = ttk.Frame(slider_row)
             group.pack(side="left", fill="x", expand=True, padx=4)
-            for endpoint, label in enumerate((name + " start x (constant)", name + " end x (constant)")):
+            for endpoint, label in enumerate((name + " start x", name + " end x")):
                 index = 2 * region + endpoint
                 cell = ttk.Frame(group)
                 cell.pack(side="left", fill="x", expand=True)
@@ -411,30 +442,30 @@ class CameraViewer:
                 self.region_sliders.append(slider)
         threshold_row = ttk.Frame(boundaries)
         threshold_row.pack(fill="x", padx=6, pady=(7, 3))
-        ttk.Label(threshold_row, text="Gradient Threshold [0-255] (constant)").pack(side="left")
+        self.threshold_label = ttk.Label(threshold_row, text="Gradient Threshold [0-255]")
+        self.threshold_label.pack(side="left")
         self.threshold_entry = ttk.Entry(threshold_row, textvariable=self.gradient_threshold_input, width=10)
         self.threshold_entry.pack(side="left", padx=10)
-        ttk.Label(threshold_row, text="Gradient Window [px] (constant)").pack(side="left", padx=(10, 0))
+        ttk.Label(threshold_row, text="Gradient Window [px]").pack(side="left", padx=(10, 0))
         self.window_size_entry = ttk.Entry(threshold_row, textvariable=self.gradient_window_size_input, width=8)
         self.window_size_entry.pack(side="left", padx=10)
-        ttk.Label(threshold_row, text="Windows [px]: Left x1-x2 | Middle x3-x4 | Right x5-x6").pack(side="left", padx=15)
+        ttk.Label(threshold_row, text="Each slider pair sets one view.").pack(side="left", padx=15)
         geometry = ttk.Frame(boundaries)
         geometry.pack(fill="x", padx=6, pady=(7, 0))
         self.geometry_entries = {}
         fields = (
-            ("Focal Length [mm] (constant)", "focal_length"),
-            ("Active Sensor Width [mm] (constant)", "sensor_width"),
-            ("Lens Reference Offset [mm] (constant)", "lens_offset"),
-            ("Filament Distance [mm] (variable)", "filament_distance"),
-            ("Mirror Apex Distance [mm] (constant)", "mirror_distance"),
-            ("Correction Coefficient (variable)", "correction"))
+            ("Focal Length [mm]", "focal_length"),
+            ("Active Sensor Width [mm]", "sensor_width"),
+            ("Lens Reference Offset [mm]", "lens_offset"),
+            ("Filament Distance [mm]", "filament_distance"),
+            ("Mirror Apex Distance [mm]", "mirror_distance"),
+            ("Correction Coefficient", "correction"))
         for index, (label, key) in enumerate(fields):
             row, column = divmod(index, 3)
             geometry.columnconfigure(column, weight=1, uniform="geometry")
             cell = ttk.Frame(geometry)
             cell.grid(row=row, column=column, sticky="ew", padx=(0, 12), pady=3)
-            variable_control = key in ("filament_distance", "correction")
-            label_options = {"foreground": "#c00000"} if variable_control else {}
+            label_options = {"foreground": "black"}
             ttk.Label(cell, text=label, **label_options).pack(anchor="w")
             entry = ttk.Entry(cell, textvariable=self.geometry_inputs[key], width=14,
                               **label_options)
@@ -442,19 +473,20 @@ class CameraViewer:
             self.geometry_entries[key] = entry
         calibration = ttk.Frame(boundaries)
         calibration.pack(fill="x", padx=6, pady=(5, 3))
-        ttk.Label(calibration, text="True Diameter [mm] (constant)").pack(side="left")
+        ttk.Label(calibration, text="True Diameter [mm]").pack(side="left")
         self.true_diameter_entry = ttk.Entry(calibration, textvariable=self.true_diameter, width=12)
         self.true_diameter_entry.pack(side="left", padx=8)
-        self.calibrate_button = ttk.Button(calibration, text="Set Correction",
+        self.calibrate_button = ttk.Button(calibration, text="Set Calibration",
                                           command=self.generate_correction, state="disabled")
         self.calibrate_button.pack(side="left")
-        ttk.Label(calibration, text="Direct View (constant):").pack(side="left", padx=(15, 5))
-        ttk.Combobox(calibration, textvariable=self.direct_view, state="readonly", width=8,
-                     values=("Left", "Middle", "Right")).pack(side="left")
-        ttk.Label(calibration, text="Mirror Angle: 45 degrees (constant)").pack(side="left", padx=12)
-        ttk.Label(boundaries, text="Distances are from the sensor; mirror apex = mirror meeting point. Constants are editable setup values.", wraplength=1080).pack(anchor="w", padx=6)
-        ttk.Label(boundaries, text="Focal length and lens offset are estimates; active sensor width assumes full-field capture.",
-                  wraplength=1080).pack(anchor="w", padx=6)
+        for button, explanation in (
+                (self.detect_button, "Refresh the available camera USB ports."),
+                (self.connect_button, "Connect to the selected camera port."),
+                (self.disconnect_button, "Disconnect the camera and turn off the LED."),
+                (self.light_filament_button, "Invert the processed frame for light filament."),
+                (self.transparent_filament_button, "Compare with a filament-free background. Remove filament, Capture Background, then reinsert. Keep camera, mirrors and lighting fixed."),
+                (self.calibrate_button, self.calibration_tooltip)):
+            add_tooltip(button, explanation)
         ttk.Label(boundaries, textvariable=self.geometry_status, wraplength=1080).pack(anchor="w", padx=6)
         ttk.Label(boundaries, textvariable=self.calibration_status, wraplength=1080).pack(anchor="w", padx=6)
         displays = ttk.Frame(main)
@@ -473,11 +505,11 @@ class CameraViewer:
         self.canvas.bind("<Configure>", self.redraw)
         self.processed_canvas.bind("<Configure>", self.redraw)
         ttk.Label(main, textvariable=self.frame_status).pack(anchor="w", pady=(8, 0))
-        ttk.Label(main, text="Blue: six independent window boundaries. Red: per-row centerlines and paired gradient peaks."
+        ttk.Label(main, text="Blue: view limits. Red: deviations/edges. Yellow: fitted transparent boundaries."
                   ).pack(anchor="w")
-        diagnostics = ttk.LabelFrame(main, text="Diagnostics Panel", padding=10)
+        diagnostics = ttk.LabelFrame(main, text="Diagnostics", padding=10)
         diagnostics.pack(fill="x", pady=(8, 0))
-        ttk.Label(diagnostics, text="Average pixel width [px]").grid(
+        ttk.Label(diagnostics, text="Mean width [px]").grid(
             row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
         self.mean_width_entries = []
         for column, name in enumerate(("Left", "Middle", "Right")):
@@ -488,7 +520,7 @@ class CameraViewer:
             entry.grid(row=2, column=column, sticky="ew", padx=(0, 15), pady=3)
             self.mean_width_entries.append(entry)
         diagnostics.columnconfigure(3, weight=2)
-        ttk.Label(diagnostics, text="Instantaneous Mean Diameter [mm]").grid(
+        ttk.Label(diagnostics, text="Mean diameter [mm]").grid(
             row=1, column=3, sticky="w")
         self.diameter_entry = ttk.Entry(diagnostics, textvariable=self.instantaneous_diameter,
                                        state="readonly", width=25)
@@ -497,6 +529,7 @@ class CameraViewer:
             row=3, column=0, columnspan=4, sticky="w", pady=(5, 0))
         self.gradient_threshold_input.trace_add("write", self.threshold_changed)
         self.gradient_window_size_input.trace_add("write", self.window_size_changed)
+        self.polynomial_order_input.trace_add("write", self.polynomial_order_changed)
         for variable in (*self.geometry_inputs.values(), self.true_diameter, self.direct_view):
             variable.trace_add("write", self.update_diameter)
         self.update_buttons()
@@ -514,12 +547,18 @@ class CameraViewer:
             state="normal" if busy and self.illumination_supported else "disabled")
 
     def illumination_changed(self, value):
+        if self.transparent_background is not None or self.background_capture is not None:
+            self.invalidate_transparent_background("LED brightness changed.")
+            self.processing_key = None
+            if self.last_frame is not None:
+                self.redraw()
         level = max(0, min(255, int(round(float(value)))))
         if self.worker is not None and self.illumination_supported:
             self.worker.set_illumination(level)
-            self.illumination_status.set(f"Requested {level}/255; applying between frames...")
+            self.illumination_status.set(f"Setting brightness: {level}/255...")
 
     def clear_frame(self):
+        self.invalidate_transparent_background("Camera connection changed.")
         self.processing_result = None
         self.processing_key = None
         self.processing_frame_sequence = None
@@ -535,7 +574,7 @@ class CameraViewer:
         self.frame_status.set("No frame received.")
         self.redraw()
 
-    def detect(self):
+    def detect(self, auto_connect=True):
         try:
             ports = usb_ports()
         except (CameraError, OSError) as error:
@@ -545,34 +584,36 @@ class CameraViewer:
         self.port_box["values"] = tuple(self.ports)
         if not ports:
             self.port.set("")
-            self.status.set("No USB serial device found. Connect the Nano with a USB data cable and detect again.")
+            self.status.set("No USB serial device found. Connect the Nano with a data cable, then Refresh.")
             return
         candidates = [p for p in ports if nano_candidate(p)]
         if len(candidates) == 1:
             match = next(label for label, p in self.ports.items() if p.device == candidates[0].device)
             self.port.set(match)
-            self.connect()
+            if auto_connect:
+                self.connect()
+            else:
+                self.status.set("Select the Nano USB port, then Connect.")
         else:
             if self.port.get() not in self.ports:
                 self.port.set(next(iter(self.ports)))
-            self.status.set("Select the Nano's USB port, then Connect selected port. "
-                            "Other boards are not probed automatically.")
+            self.status.set("Select the Nano USB port, then Connect.")
 
     def connect(self):
         if self.worker is not None:
             return
         selected = self.ports.get(self.port.get())
         if selected is None:
-            self.status.set("Detect USB ports first, then select the Nano ESP32.")
+            self.status.set("Refresh, select the Nano port, then Connect.")
             return
         self.clear_frame()
         self.illumination_supported = False
-        self.illumination.set(255)
-        self.illumination_status.set("Checking camera illumination support...")
+        self.illumination_status.set("Checking LED control...")
         self.identity.set(f"USB board: {selected.device}; VID:PID "
                           f"{selected.vid:04X}:{selected.pid:04X}. Reading sensor identity...")
         self.status.set(f"Connecting to {selected.device}...")
         self.worker = CameraWorker(selected.device, int(self.baud.get()), self.events, self.frames)
+        self.worker.set_illumination(int(self.illumination.get()))
         self.accept_frames = True
         self.worker.start()
         self.update_buttons()
@@ -581,7 +622,7 @@ class CameraViewer:
         self.accept_frames = False
         self.illumination_supported = False
         self.illumination.set(0)
-        self.illumination_status.set("Disconnected. LED is turned off when USB shutdown completes.")
+        self.illumination_status.set("Disconnecting; LED turns off when complete.")
         self.update_buttons()
         if self.worker:
             self.worker.stop.set()
@@ -654,7 +695,24 @@ class CameraViewer:
         else:
             self.update_processing_status()
 
+    def polynomial_order_changed(self, *args):
+        try:
+            order = int(self.polynomial_order_input.get())
+            if not 0 <= order <= 8:
+                raise ValueError
+        except ValueError:
+            self.polynomial_error = f"Polynomial order must be 0-8; using {self.polynomial_order}."
+            self.polynomial_order_entry.state(["invalid"])
+            self.update_processing_status()
+            return
+        self.polynomial_error = ""
+        self.polynomial_order_entry.state(["!invalid"])
+        self.polynomial_order = order
+        self.redraw()
+
     def update_processing_status(self):
+        self.threshold_label.configure(text="Difference Threshold [0-255]" if self.transparent_filament_mode.get()
+                                       else "Gradient Threshold [0-255]")
         if self.processing_result is None:
             status = "Waiting for a camera frame."
         else:
@@ -663,25 +721,91 @@ class CameraViewer:
                        for value in self.processing_result.center_x]
             height = self.processing_result.height
             status = (f"Valid rows: Left {counts[0]}/{height}, Middle {counts[1]}/{height}, "
-                      f"Right {counts[2]}/{height}. Mean center x: {centers[0]}, {centers[1]}, {centers[2]}. "
-                      f"Applied threshold: {self.gradient_threshold:g}. Y window: {self.gradient_window_size}.")
+                      f"Right {counts[2]}/{height} | Centers [px]: {centers[0]}, {centers[1]}, {centers[2]}")
+        if self.processing_result is not None and self.processing_result.transparent_filament_mode:
+            status += " | Transparent: " + "; ".join(
+                f"{name}: {reason}" for name, reason in zip(("Left", "Middle", "Right"), self.processing_result.transparent_status))
+        if self.polynomial_error:
+            status = self.polynomial_error + " " + status
         if self.threshold_error:
             status = self.threshold_error + " " + status
         if self.window_size_error:
             status = self.window_size_error + " " + status
         self.processing_status.set(status)
 
+    def invalidate_transparent_background(self, reason):
+        self.transparent_background = None
+        self.background_capture = None
+        if self.worker is not None:
+            self.worker.background_frames = None
+        while not self.background_frames.empty():
+            self.background_frames.get_nowait()
+        if hasattr(self, "capture_background_button"):
+            self.capture_background_button.configure(state="normal", text="Capture Background")
+        self.background_revision += 1
+        if hasattr(self, "background_status"):
+            self.background_status.set(reason + " Capture Background again without filament.")
+
+    def capture_transparent_background(self):
+        frame = self.last_frame
+        if frame is None or not 0 <= time.monotonic()-frame.received_at <= 2:
+            self.background_status.set("Need a fresh camera frame. Remove filament, then capture.")
+            return
+        if self.background_capture is not None:
+            return
+        self.invalidate_transparent_background("Capturing background.")
+        self.background_capture = BackgroundCapture(frame.width, frame.height, time.monotonic())
+        if self.worker is not None:
+            self.worker.background_frames = self.background_frames
+        self.capture_background_button.configure(state="disabled", text="Capturing...")
+        self.background_status.set("Keep filament removed: averaging for 5.0 s | Frames: 0")
+        self.redraw()
+
+    def update_background_capture(self, frame=None):
+        capture = self.background_capture
+        if capture is None:
+            return
+        try:
+            while not self.background_frames.empty():
+                capture.add(self.background_frames.get_nowait())
+            if frame is not None:
+                capture.add(frame)
+            remaining = max(0, capture.deadline-time.monotonic())
+            if remaining > 0:
+                self.background_status.set(f"Keep filament removed: {remaining:.1f} s remaining | Frames: {capture.count}")
+                return
+            if self.worker is not None:
+                self.worker.background_frames = None
+            self.transparent_background = capture.finish()
+            self.background_capture = None
+            self.background_revision += 1
+            self.capture_background_button.configure(state="normal", text="Capture Background")
+            self.background_status.set(f"Background ready: averaged {capture.count} frames over 5 s. Reinsert filament.")
+            self.redraw()
+        except ValueError as error:
+            self.invalidate_transparent_background(str(error))
+            if self.last_frame is not None:
+                self.redraw()
+
     def process_frame(self):
-        key = (self.last_frame.sequence, self.last_frame.received_at,
+        background = self.transparent_background
+        if background is not None and (background.width, background.height) != (self.last_frame.width, self.last_frame.height):
+            self.invalidate_transparent_background("Resolution changed.")
+            background = None
+        key = (self.last_frame.sequence, self.last_frame.received_at, self.background_revision,
                *(variable.get() for variable in self.region_coordinates),
-               self.gradient_threshold, self.gradient_window_size, self.light_filament_mode.get())
+               self.gradient_threshold, self.gradient_window_size, self.light_filament_mode.get(),
+               self.transparent_filament_mode.get(), self.polynomial_order)
         if key != self.processing_key:
             self.processing_result = measure_filament_windows(
                 self.last_frame.pixels, self.last_frame.width, self.last_frame.height,
                 tuple((self.region_coordinates[i].get(), self.region_coordinates[i + 1].get())
                       for i in range(0, 6, 2)), self.gradient_threshold,
                 gradient_window_size=self.gradient_window_size,
-                light_filament_mode=self.light_filament_mode.get())
+                light_filament_mode=self.light_filament_mode.get(),
+                transparent_filament_mode=self.transparent_filament_mode.get(),
+                transparent_background=background.pixels if background is not None else None,
+                require_transparent_background=True, polynomial_order=self.polynomial_order)
             self.processing_key = key
             self.processing_frame_sequence = self.last_frame.sequence
             for variable, mean in zip(self.mean_width_vars, self.processing_result.mean_widths_px):
@@ -689,11 +813,20 @@ class CameraViewer:
         self.update_processing_status()
         self.update_diameter()
 
+    def calibration_tooltip(self):
+        self.update_diameter()
+        explanation = "Calibrate using the True Diameter value."
+        return explanation + (f"\nError: {self.calibration_error}" if self.calibration_error else "")
+
     def update_diameter(self, *args):
         self.base_diameter = None
         self.geometry_scales = None
         self.instantaneous_diameter.set("")
         self.calibrate_button.config(state="disabled")
+        self.calibration_error = "need a valid diameter measurement."
+        invalid = []
+        field_names = dict(focal_length="Focal Length", sensor_width="Active Sensor Width", lens_offset="Lens Reference Offset",
+                           filament_distance="Filament Distance", mirror_distance="Mirror Apex Distance", correction="Correction Coefficient")
         values = {}
         for key, variable in self.geometry_inputs.items():
             try:
@@ -704,6 +837,7 @@ class CameraViewer:
                 self.geometry_entries[key].state(["!invalid"])
             except ValueError:
                 self.geometry_entries[key].state(["invalid"])
+                invalid.append(field_names[key])
         try:
             true = float(self.true_diameter.get())
             if not math.isfinite(true) or true <= 0:
@@ -713,11 +847,13 @@ class CameraViewer:
             true = None
             self.true_diameter_entry.state(["invalid"] if self.true_diameter.get() else ["!invalid"])
         if len(values) != len(self.geometry_inputs):
-            self.geometry_status.set("Enter valid geometry and a positive correction coefficient; unknown distances are blank.")
+            self.calibration_error = "need valid " + ", ".join(invalid + (["True Diameter"] if true is None else [])) + "."
+            self.geometry_status.set("Enter valid geometry and a correction greater than 0.")
             return
         try:
             if self.last_frame is None or self.processing_result is None:
-                self.geometry_status.set("Geometry entered; waiting for a camera frame.")
+                self.geometry_status.set("Geometry ready; waiting for a frame.")
+                self.calibration_error = "need " + ("True Diameter greater than 0 and " if true is None else "") + "a current camera frame with detected filament edges."
                 return
             self.geometry_scales = diameter_scales(
                 self.last_frame.width, *(values[key] for key in (
@@ -729,14 +865,21 @@ class CameraViewer:
                 raise ValueError("Correction produces an invalid diameter.")
             self.instantaneous_diameter.set(f"{corrected:.4f}")
             scales = ", ".join(f"{scale:.6g}" for scale in self.geometry_scales)
-            self.geometry_status.set(f"Calculated mm/pixel (Left, Middle, Right): {scales}.")
-            fresh = time.monotonic() - self.last_frame.received_at <= 2
-            if true is not None and fresh:
-                self.calibrate_button.config(state="normal")
+            self.geometry_status.set(f"Scale [mm/px], Left/Middle/Right: {scales}.")
+            fresh = 0 <= time.monotonic() - self.last_frame.received_at <= 2
             if not fresh:
-                self.geometry_status.set(self.geometry_status.get() + " Last frame is stale; calibration disabled.")
+                self.calibration_error = "need a fresh camera frame; the last frame has expired."
+                self.geometry_status.set(self.geometry_status.get() + " Frame expired; calibration unavailable.")
+            elif true is None:
+                self.calibration_error = "need True Diameter greater than 0."
+            elif not math.isfinite(true/self.base_diameter) or true/self.base_diameter <= 0:
+                self.calibration_error = "True Diameter and measured diameter produce an invalid calibration coefficient."
+            else:
+                self.calibration_error = None
+                self.calibrate_button.config(state="normal")
         except (ValueError, OverflowError) as error:
             self.base_diameter = None
+            self.calibration_error = "need valid filament edges in all three views." if str(error).startswith("Three ") else str(error)
             self.geometry_status.set(str(error))
 
     def generate_correction(self):
@@ -746,11 +889,11 @@ class CameraViewer:
             return
         coefficient = float(self.true_diameter.get()) / self.base_diameter
         if not math.isfinite(coefficient) or coefficient <= 0:
-            self.calibration_status.set("Cannot generate a finite positive correction coefficient.")
+            self.calibration_status.set("Cannot calculate correction. Check the reference diameter and frame.")
             return
         sequence = self.last_frame.sequence
         self.geometry_inputs["correction"].set(f"{coefficient:.15g}")
-        self.calibration_status.set(f"Correction generated once from frame {sequence}: {coefficient:.8g}.")
+        self.calibration_status.set(f"Calibration set: {coefficient:.8g} (frame {sequence}).")
 
     def draw_region_lines(self):
         self.processed_canvas.delete("region_boundary")
@@ -804,9 +947,123 @@ class CameraViewer:
                 self.processed_bounds = (left, top, image.width(), image.height())
         self.draw_region_lines()
 
+    def settings_snapshot(self):
+        return dict(version=1, frame_width=self.region_frame_width,
+                    regions=[var.get() for var in self.region_coordinates],
+                    geometry={key: var.get() for key, var in self.geometry_inputs.items()},
+                    threshold=self.gradient_threshold_input.get(),
+                    gradient_window_size=self.gradient_window_size_input.get(),
+                    light_filament_mode=self.light_filament_mode.get(),
+                    transparent_filament_mode=self.transparent_filament_mode.get(),
+                    polynomial_order=self.polynomial_order_input.get(),
+                    direct_view=self.direct_view.get(), true_diameter=self.true_diameter.get(),
+                    port=self.port.get().split(" | ")[0], baud=self.baud.get(), illumination=int(self.illumination.get()))
+
+    def restore_settings(self, data):
+        validate_settings(data)
+        self.invalidate_transparent_background("Setup loaded.")
+        self.sync_region_width(data["frame_width"])
+        for var, value in zip(self.region_coordinates, data["regions"]):
+            var.set(value)
+        for key, var in self.geometry_inputs.items():
+            var.set(data["geometry"][key])
+        self.gradient_threshold_input.set(data["threshold"])
+        self.gradient_window_size_input.set(data["gradient_window_size"])
+        self.light_filament_mode.set(data["light_filament_mode"])
+        self.transparent_filament_mode.set(data.get("transparent_filament_mode", False))
+        self.polynomial_order_input.set(data.get("polynomial_order", "3"))
+        self.direct_view.set(data["direct_view"])
+        self.true_diameter.set(data["true_diameter"])
+        if "port" in data:
+            self.port.set(next((label for label, port in self.ports.items() if port.device == data["port"]), data["port"]))
+        if "baud" in data:
+            self.baud.set(data["baud"])
+        if "illumination" in data:
+            self.illumination.set(data["illumination"])
+        self.saved_settings = self.pending_settings = self.settings_snapshot()
+
+    def check_operating_configuration(self):
+        now = time.monotonic()
+        if now-self.configuration_checked_at < .5:
+            return
+        self.configuration_checked_at = now
+        identifier = None
+        try:
+            if not self.configuration_request_path.exists():
+                return
+            if self.configuration_request_path.stat().st_size > 32768:
+                raise ValueError("Camera configuration request is too large.")
+            request = json.loads(self.configuration_request_path.read_text(encoding="utf-8"))
+            identifier = request["id"]
+            if identifier == self.configuration_request_id:
+                return
+            if request.get("version") != 1 or not isinstance(identifier, str):
+                raise ValueError("Invalid camera configuration request.")
+            data = validate_settings(request["settings"])
+            port = self.port.get().split(" | ")[0]
+            if self.worker is not None and (data.get("port", port) != port or data.get("baud", self.baud.get()) != self.baud.get()):
+                self.disconnect()
+            self.restore_settings(data)
+            if self.worker is not None and self.accept_frames and self.illumination_supported:
+                self.worker.set_illumination(int(self.illumination.get()))
+            self.redraw()
+            self.update_diameter()
+            if self.settings_path is not None:
+                save_settings(self.settings_snapshot(), self.settings_path)
+            self.settings_status.set(f"Operating configuration loaded: {request.get('name', '')}")
+            write_json(dict(id=identifier, ok=True), self.configuration_result_path)
+            self.configuration_request_id = identifier
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            self.settings_status.set(f"Camera configuration not loaded: {error}")
+            if identifier is not None:
+                self.configuration_request_id = identifier
+                try:
+                    write_json(dict(id=identifier, ok=False, error=str(error)), self.configuration_result_path)
+                except OSError:
+                    pass
+
+    def persist_settings(self, force=False):
+        if self.settings_path is None:
+            return
+        snapshot = self.settings_snapshot()
+        now = time.monotonic()
+        if snapshot != self.pending_settings:
+            self.pending_settings, self.settings_changed_at = snapshot, now
+        if snapshot != self.saved_settings and (force or now - self.settings_changed_at >= 0.5):
+            try:
+                save_settings(snapshot, self.settings_path)
+                self.saved_settings = snapshot
+                self.settings_status.set("Settings saved.")
+            except (OSError, ValueError) as error:
+                self.settings_status.set(f"Could not save viewer settings: {error}")
+
+    def publish_measurement(self):
+        if self.measurement_publisher is None:
+            return
+        frame = self.last_frame
+        now = time.monotonic()
+        fresh = frame is not None and 0 <= now - frame.received_at <= 2
+        connected = self.worker is not None and self.accept_frames
+        text = self.instantaneous_diameter.get()
+        valid = bool(connected and fresh and text)
+        self.measurement_publisher.publish({
+            "protocol": 1, "published_at": now,
+            "camera_settings": self.settings_snapshot(),
+            "frame_sequence": frame.sequence if frame is not None else None,
+            "frame_received_at": frame.received_at if frame is not None else None,
+            "diameter_mm": float(text) if valid else None,
+            "mean_widths_px": list(self.processing_result.mean_widths_px)
+            if self.processing_result is not None else [None, None, None],
+            "valid": valid,
+            "reason": "Live" if valid else (
+                "Camera disconnected" if not connected else
+                "Camera frame stale or missing" if not fresh else self.geometry_status.get()),
+        })
+
     def poll(self):
         if self.closing:
             return
+        self.check_operating_configuration()
         while True:
             try:
                 kind, value = self.events.get_nowait()
@@ -818,23 +1075,23 @@ class CameraViewer:
                 self.identity.set(f"{value.get('board', 'Nano ESP32')} | firmware {value.get('firmware', '?')} | "
                                   f"{value.get('sensor', 'unknown sensor')} | PID {value.get('sensor_pid')} | "
                                   f"sensor VER {version_text}")
-                self.status.set("Connected. Receiving grayscale frames..." if value["camera_ready"]
-                                else "USB board detected; camera initialization failed.")
+                self.status.set("Connected; receiving frames." if value["camera_ready"]
+                                else "Nano connected; camera failed to start.")
                 self.illumination_supported = value.get("led_control") is True and value["camera_ready"]
                 self.illumination_status.set(
-                    "LED ready; starts HIGH. 0 = off, 255 = continuous 3.3 V HIGH."
+                    "LED ready. 0 = off; 255 = full brightness."
                     if self.illumination_supported else
-                    "LED control unavailable. Upload NanoOV7670USB firmware 1.3 or newer.")
+                    "LED unavailable. Requires Nano firmware 1.3 or later.")
                 self.update_buttons()
             elif kind == "illumination":
                 self.illumination_status.set(
-                    f"Applied {value}/255 ({value / 255 * 100:.0f}%); A6 PWM, 3.3 V HIGH.")
+                    f"Brightness: {value / 255 * 100:.0f}% ({value}/255).")
             elif kind == "error":
                 self.status.set(value)
             elif kind == "stopped":
                 self.worker = None
                 self.illumination_supported = False
-                self.illumination_status.set("LED control disconnected; reconnect to enable it.")
+                self.illumination_status.set("LED disconnected. Reconnect to enable.")
                 if self.status.get() == "Disconnecting...":
                     self.status.set("Disconnected.")
                 self.update_buttons()
@@ -842,6 +1099,7 @@ class CameraViewer:
             frame = self.frames.get_nowait()
         except queue.Empty:
             frame = None
+        self.update_background_capture(frame if self.accept_frames else None)
         if frame is not None and self.accept_frames:
             self.last_frame = frame
             self.frame_count += 1
@@ -853,13 +1111,15 @@ class CameraViewer:
             fps = (self.frame_count - 1) / elapsed if elapsed > 0 else 0
             age = time.monotonic() - self.last_frame.received_at
             self.frame_status.set(f"Frame {self.last_frame.sequence} | {self.last_frame.width} x "
-                                  f"{self.last_frame.height} | GRAY8 | received {fps:.1f} fps | "
-                                  f"last received {age:.1f} s ago"
+                                  f"{self.last_frame.height} | {fps:.1f} fps | frame age {age:.1f} s"
                                   + (" | STALE / disconnected" if age > 2 or self.worker is None else ""))
         self.update_diameter()
+        self.publish_measurement()
+        self.persist_settings()
         self.root.after(50, self.poll)
 
     def close(self):
+        self.persist_settings(force=True)
         self.closing = True
         if self.worker:
             self.worker.stop.set()
@@ -886,12 +1146,12 @@ def main():
                                 help="Initial " + view + " window " + endpoint + " x coordinate.")
     parser.add_argument("--light-filament-mode", action="store_true", help="Invert working pixels before edge detection.")
     parser.add_argument("--threshold", type=float, help="Initial gradient threshold (0-255).")
-    parser.add_argument("--gradient-window-size", type=int, default=10, help="Vertical averaging window in pixels (default 10).")
+    parser.add_argument("--gradient-window-size", type=int, help="Vertical averaging window in pixels (default 10 or saved setting).")
     for option in ("focal-length", "sensor-width", "lens-offset", "filament-distance",
                    "mirror-distance", "correction", "true-diameter"):
         parser.add_argument("--" + option, type=float, help="Initial " + option.replace("-", " ") + ".")
     args = parser.parse_args()
-    if args.gradient_window_size < 1:
+    if args.gradient_window_size is not None and args.gradient_window_size < 1:
         parser.error("Gradient window size must be a positive whole number.")
     first = args.first_x if args.first_x is not None else 20
     second = args.second_x if args.second_x is not None else 106
@@ -920,21 +1180,48 @@ def main():
         if not ports:
             print("No USB serial devices found.")
         return
+    configure_app_identity("PLARecycler.Camera")
     root = tk.Tk()
     app = CameraViewer(root)
-    for variable, value in zip(app.region_coordinates, coordinates):
-        variable.set(value)
-    app.light_filament_mode.set(args.light_filament_mode)
+    app.settings_path = SETTINGS_PATH
+    try:
+        saved = load_settings()
+        if saved is not None:
+            app.restore_settings(saved)
+            app.settings_status.set("Settings restored.")
+    except (OSError, ValueError) as error:
+        app.settings_status.set(f"Saved settings could not be restored: {error}")
+    try:
+        app.measurement_publisher = MeasurementPublisher()
+        link_text = "Diameter sharing with recycler controls enabled."
+    except OSError as error:
+        link_text = f"Diameter sharing unavailable: {error}"
+    ttk.Label(app.connection_section.content, text=link_text, wraplength=1000).pack(anchor="w", padx=10)
+    ttk.Label(app.connection_section.content, textvariable=app.settings_status, wraplength=1000).pack(anchor="w", padx=10)
+    if any(getattr(args, name) is not None for name in (
+            "first_x", "second_x", "third_x", "fourth_x", "left_start", "left_end",
+            "middle_start", "middle_end", "right_start", "right_end")):
+        app.region_frame_width = 320
+        for variable, value in zip(app.region_coordinates, coordinates):
+            variable.set(value)
+    if args.light_filament_mode:
+        app.light_filament_mode.set(True)
     if args.threshold is not None:
         app.gradient_threshold_input.set(f"{args.threshold:g}")
-    app.gradient_window_size_input.set(str(args.gradient_window_size))
+    if args.gradient_window_size is not None:
+        app.gradient_window_size_input.set(str(args.gradient_window_size))
     for key, variable in (*app.geometry_inputs.items(), ("true_diameter", app.true_diameter)):
         value = getattr(args, key)
         if value is not None:
             variable.set(f"{value:.15g}")
     if args.connect:
         root.after(300, app.detect)
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        app.persist_settings(force=True)
+        if app.measurement_publisher is not None:
+            app.measurement_publisher.close()
 
 
 if __name__ == "__main__":

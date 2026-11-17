@@ -239,6 +239,34 @@ class DiscoveryAndWorkerTests(unittest.TestCase):
 
 
 class WindowTests(unittest.TestCase):
+    def test_publishes_exact_display_value_and_invalidates_stale_or_disconnected_frames(self):
+        root = tk.Tk()
+        root.withdraw()
+        publisher = mock.Mock()
+        try:
+            app = viewer.CameraViewer(root, measurement_publisher=publisher)
+            app.worker = object()
+            app.accept_frames = True
+            app.last_frame = viewer.Frame(42, 320, 240, bytes(320 * 240), time.monotonic())
+            app.instantaneous_diameter.set("1.7654")
+            app.processing_result = SimpleNamespace(mean_widths_px=(10, 11, 12))
+            app.publish_measurement()
+            packet = publisher.publish.call_args.args[0]
+            self.assertTrue(packet["valid"])
+            self.assertEqual(packet["diameter_mm"], 1.7654)
+            self.assertEqual(packet["mean_widths_px"], [10, 11, 12])
+            app.last_frame = viewer.Frame(42, 320, 240, bytes(320 * 240), time.monotonic() - 3)
+            app.publish_measurement()
+            self.assertFalse(publisher.publish.call_args.args[0]["valid"])
+            self.assertIsNone(publisher.publish.call_args.args[0]["diameter_mm"])
+            app.worker = None
+            app.publish_measurement()
+            self.assertEqual(publisher.publish.call_args.args[0]["reason"], "Camera disconnected")
+        finally:
+            for timer in root.tk.call("after", "info"):
+                root.after_cancel(timer)
+            root.destroy()
+
     def test_six_window_sliders_are_independent_and_scale_as_pairs(self):
         root = tk.Tk()
         root.withdraw()
@@ -297,6 +325,58 @@ class WindowTests(unittest.TestCase):
                 root.after_cancel(timer)
             root.destroy()
 
+    def test_transparent_toggle_reprocesses_and_keeps_raw_pixels(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = viewer.CameraViewer(root)
+            pixels = bytes(170 if any(a <= x < b for a, b in ((25, 56), (125, 156), (245, 276))) else 130
+                           for y in range(30) for x in range(320))
+            frame = viewer.Frame(8, 320, 30, pixels, time.monotonic())
+            app.last_frame = frame
+            app.gradient_threshold_input.set("2")
+            app.redraw()
+            self.assertFalse(app.transparent_filament_mode.get())
+            app.transparent_filament_button.invoke()
+            self.assertTrue(app.processing_result.transparent_filament_mode)
+            self.assertEqual(app.processing_result.mean_widths_px, (None,)*3)
+            self.assertIn("Capture Background", app.processing_status.get())
+            app.last_frame = viewer.Frame(7, 320, 30, bytes([130])*320*30, time.monotonic())
+            with mock.patch.object(viewer.time, "monotonic", return_value=100):
+                app.last_frame = viewer.Frame(7, 320, 30, bytes([130])*320*30, 100)
+                app.capture_background_button.invoke()
+            self.assertIsNone(app.transparent_background)
+            self.assertTrue(app.capture_background_button.instate(["disabled"]))
+            for index in range(10):
+                at = 100+index*.5
+                app.background_frames.put(viewer.Frame(index, 320, 30, bytes([130])*320*30, at))
+            with mock.patch.object(viewer.time, "monotonic", return_value=105):
+                app.update_background_capture()
+            self.assertIsNotNone(app.transparent_background)
+            self.assertEqual(app.transparent_background.frame_count, 10)
+            app.last_frame = frame
+            app.redraw()
+            for mean in app.processing_result.mean_widths_px:
+                self.assertAlmostEqual(mean, 30)
+            app.polynomial_order_input.set("2")
+            self.assertEqual(app.processing_result.polynomial_order, 2)
+            app.polynomial_order_input.set("99")
+            self.assertEqual(app.polynomial_order, 2)
+            self.assertIn("Polynomial order", app.processing_status.get())
+            self.assertIs(app.last_frame, frame)
+            self.assertEqual(app.photo.get(0, 0), (130, 130, 130))
+            self.assertEqual(app.processed_photo.get(0, 0), (130, 130, 130))
+            self.assertIn("Transparent:", app.processing_status.get())
+            app.illumination_changed("200")
+            self.assertIsNone(app.transparent_background)
+            self.assertEqual(app.processing_result.mean_widths_px, (None,)*3)
+            app.transparent_filament_button.invoke()
+            self.assertFalse(app.processing_result.transparent_filament_mode)
+        finally:
+            for timer in root.tk.call('after', 'info'):
+                root.after_cancel(timer)
+            root.destroy()
+
     def test_geometry_defaults_and_single_press_calibration(self):
         root = tk.Tk()
         root.withdraw()
@@ -306,6 +386,25 @@ class WindowTests(unittest.TestCase):
             self.assertEqual(app.geometry_inputs["focal_length"].get(), "3.37")
             self.assertEqual(app.geometry_inputs["sensor_width"].get(), "2.304")
             self.assertEqual(app.geometry_inputs["lens_offset"].get(), "3.4")
+            self.assertEqual(app.calibrate_button.cget("text"), "Set Calibration")
+            self.assertEqual(app.filament_bounds_title.cget("text"), "Filament Bounds")
+            self.assertIn("bold", str(app.filament_bounds_title.cget("font")))
+            self.assertEqual(app.illumination_slider.cget("foreground"), "black")
+            for entry in app.geometry_entries.values():
+                self.assertEqual(str(entry.cget("foreground")), "black")
+            def descendants(widget):
+                return [child for parent in widget.winfo_children() for child in [parent, *descendants(parent)]]
+            for widget in descendants(app.control_section):
+                if "text" in widget.keys():
+                    label = str(widget.cget("text"))
+                    self.assertNotIn("(constant)", label)
+                    self.assertNotIn("(variable)", label)
+                    self.assertFalse(label.startswith(("Direct View", "Mirrors:", "Measure distances", "Focal length and lens offset are estimates")))
+                if widget.winfo_class() == "TCombobox":
+                    self.assertNotEqual(str(widget.cget("textvariable")), str(app.direct_view))
+            self.assertIn("Filament Distance", app.calibrate_button.tooltip.text())
+            self.assertIn("Mirror Apex Distance", app.calibrate_button.tooltip.text())
+            self.assertIn("Error:", app.calibrate_button.tooltip.text())
             self.assertIn("disabled", app.calibrate_button.state())
             app.last_frame = viewer.Frame(1, 320, 240, bytes(320 * 240), time.monotonic())
             app.processing_result = SimpleNamespace(mean_widths_px=(10, 20, 10))
@@ -313,7 +412,17 @@ class WindowTests(unittest.TestCase):
                                ("filament_distance", "55"), ("mirror_distance", "105")):
                 app.geometry_inputs[key].set(value)
             self.assertAlmostEqual(float(app.instantaneous_diameter.get()), 1.8)
+            app.true_diameter.set("")
+            self.assertIn("need True Diameter", app.calibrate_button.tooltip.text())
             app.true_diameter.set("2")
+            self.assertNotIn("Error:", app.calibrate_button.tooltip.text())
+            app.geometry_inputs["mirror_distance"].set("40")
+            self.assertIn("Distances must satisfy", app.calibrate_button.tooltip.text())
+            app.geometry_inputs["mirror_distance"].set("105")
+            app.processing_result = SimpleNamespace(mean_widths_px=(10, None, 10))
+            self.assertIn("need valid filament edges in all three views", app.calibrate_button.tooltip.text())
+            app.processing_result = SimpleNamespace(mean_widths_px=(10, 20, 10))
+            app.update_diameter()
             self.assertNotIn("disabled", app.calibrate_button.state())
             app.calibrate_button.invoke()
             coefficient = app.geometry_inputs["correction"].get()
@@ -332,7 +441,10 @@ class WindowTests(unittest.TestCase):
             app.last_frame = viewer.Frame(2, 320, 240, bytes(320 * 240), time.monotonic() - 3)
             app.update_diameter()
             self.assertIn("disabled", app.calibrate_button.state())
+            self.assertIn("fresh camera frame", app.calibrate_button.tooltip.text())
             app.clear_frame()
+            self.assertIn("Geometry ready", app.geometry_status.get())
+            self.assertIn("current camera frame", app.calibrate_button.tooltip.text())
             self.assertEqual(app.instantaneous_diameter.get(), "")
         finally:
             for timer in root.tk.call("after", "info"):
@@ -351,6 +463,17 @@ class WindowTests(unittest.TestCase):
             app.redraw()
             root.update_idletasks()
             self.assertIsNotNone(app.photo)
+            self.assertEqual(app.refresh_button.cget("text"), "Refresh")
+            self.assertEqual(app.refresh_button.master, app.port_box.master)
+            self.assertEqual(app.connect_button.master, app.port_box.master)
+            self.assertEqual(app.disconnect_button.master, app.port_box.master)
+            port = mock.Mock(device="COM9", description="Nano ESP32", product="Nano ESP32", vid=0x2341, pid=0x0070)
+            with mock.patch.object(viewer, "usb_ports", return_value=[port]), mock.patch.object(app, "connect") as connect:
+                app.refresh_button.invoke()
+                connect.assert_not_called()
+                self.assertIn("COM9", app.port.get())
+                app.detect()  # Launcher detection still connects automatically.
+                connect.assert_called_once()
             with mock.patch.object(viewer, "usb_ports", return_value=[]):
                 app.detect()
             self.assertIn("No USB serial", app.status.get())

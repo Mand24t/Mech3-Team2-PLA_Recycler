@@ -1,0 +1,54 @@
+{
+  "identity": {
+    "protocol": 1,
+    "firmware": "nano-ov7670-usb-1.4",
+    "board": "Arduino Nano ESP32",
+    "chip": "ESP32-S3",
+    "chip_revision": 0,
+    "sensor": "OV7670",
+    "sensor_pid": 118,
+    "sensor_ver": 115,
+    "sensor_midh": 127,
+    "sensor_midl": 162,
+    "camera_ready": true,
+    "pixel_format": "GRAY8",
+    "width": 320,
+    "height": 240,
+    "external_fifo": false,
+    "led_control": true,
+    "led_pin": "A6",
+    "error": ""
+  },
+  "frames": [
+    {
+      "sequence": 1,
+      "width": 320,
+      "height": 240,
+      "crc_valid": true
+    },
+    {
+      "sequence": 2,
+      "width": 320,
+      "height": 240,
+      "crc_valid": true
+    },
+    {
+      "sequence": 3,
+      "width": 320,
+      "height": 240,
+      "crc_valid": true
+    },
+    {
+      "sequence": 4,
+      "width": 320,
+      "height": 240,
+      "crc_valid": true
+    },
+    {
+      "sequence": 5,
+      "width": 320,
+      "height": 240,
+      "crc_valid": true
+    }
+  ]
+}

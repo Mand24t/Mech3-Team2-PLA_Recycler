@@ -1,0 +1,89 @@
+{
+  "startup": {
+    "led_gpio": 13,
+    "led_value": 255,
+    "led_ready": true,
+    "high_samples": 2000,
+    "samples": 2000,
+    "sample_us": 4038,
+    "pwm_hz": 20000
+  },
+  "identity": {
+    "protocol": 1,
+    "firmware": "nano-ov7670-usb-1.5",
+    "board": "Arduino Nano ESP32",
+    "chip": "ESP32-S3",
+    "chip_revision": 0,
+    "sensor": "OV7670",
+    "sensor_pid": 118,
+    "sensor_ver": 115,
+    "sensor_midh": 127,
+    "sensor_midl": 162,
+    "camera_ready": true,
+    "pixel_format": "GRAY8",
+    "width": 320,
+    "height": 240,
+    "external_fifo": false,
+    "led_control": true,
+    "led_pin": "A6",
+    "error": ""
+  },
+  "levels": [
+    {
+      "led_gpio": 13,
+      "led_value": 0,
+      "led_ready": true,
+      "high_samples": 0,
+      "samples": 2000,
+      "sample_us": 4034,
+      "pwm_hz": 20000,
+      "frame_sequence": 1,
+      "frame_crc_valid": true
+    },
+    {
+      "led_gpio": 13,
+      "led_value": 64,
+      "led_ready": true,
+      "high_samples": 486,
+      "samples": 2000,
+      "sample_us": 4034,
+      "pwm_hz": 20000,
+      "frame_sequence": 2,
+      "frame_crc_valid": true
+    },
+    {
+      "led_gpio": 13,
+      "led_value": 128,
+      "led_ready": true,
+      "high_samples": 1008,
+      "samples": 2000,
+      "sample_us": 4035,
+      "pwm_hz": 20000,
+      "frame_sequence": 3,
+      "frame_crc_valid": true
+    },
+    {
+      "led_gpio": 13,
+      "led_value": 192,
+      "led_ready": true,
+      "high_samples": 1479,
+      "samples": 2000,
+      "sample_us": 4034,
+      "pwm_hz": 20000,
+      "frame_sequence": 4,
+      "frame_crc_valid": true
+    },
+    {
+      "led_gpio": 13,
+      "led_value": 255,
+      "led_ready": true,
+      "high_samples": 2000,
+      "samples": 2000,
+      "sample_us": 4032,
+      "pwm_hz": 20000,
+      "frame_sequence": 5,
+      "frame_crc_valid": true
+    }
+  ],
+  "passed": true
+}

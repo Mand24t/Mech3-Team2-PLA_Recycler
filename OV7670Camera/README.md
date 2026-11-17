@@ -1,7 +1,48 @@
 # OV7670 USB viewer - first stage
 
 Standalone files for an Arduino Nano ESP32 and an OV7670 without an external FIFO.
-The existing recycler Python and Mega sketch are not imported or modified.
+The viewer does not import recycler controls or open the Mega's USB port.
+
+## Live diameter in the recycler interface
+
+Open `Launch Camera.exe`, connect the Nano, and enter valid measurement geometry
+so **Mean diameter [mm]** contains a reading. The launcher uses the
+current Python viewer, so no executable rebuild or firmware upload is needed.
+Start the recycler interface from the project folder:
+
+    .\.venv-camera\Scripts\python.exe Recycler_Python_Servo.py
+
+The viewer automatically saves geometry, correction coefficient, true-diameter
+entry, view regions, gradient settings and light-filament mode in the local
+`OV7670Camera/viewer_settings.json` file. Settings restore on startup; explicit
+command-line options override saved values. This machine-specific file is ignored
+by Git. After entering calibration values, allow a moment for autosave or close
+the viewer normally. Older running instances need restarting once to load this
+feature. A blank diameter cannot be shared as a numeric reading; inspect the
+geometry/processing status in the camera viewer for the reason.
+
+Its **Live camera measurement** panel displays the same diameter, rounded to the
+same four decimal places. The applications may start in either order and reconnect
+automatically. Monitoring works even if the Mega is disconnected.
+
+The viewer publishes JSON lines over TCP at `127.0.0.1:47670`, on this computer
+only, at approximately 10 updates/second. Messages include protocol version, camera
+frame sequence, frame receipt and publication monotonic timestamps, diameter in
+millimeters, left/middle/right mean pixel widths, validity, and a status reason.
+The publisher runs separately from frame acquisition and keeps only current data.
+It does not log a time series. Only one camera viewer should publish on this port;
+an occupied port is reported in the viewer's connection panel.
+
+In `Recycler_Python_Servo.py`, `camera_diameter_mm` is a float for calculations,
+or `None` if missing, invalid, disconnected, or older than two seconds.
+`camera_frame_sequence` identifies the source frame; repeated messages do not
+represent new camera frames. The receiver updates these values and Tk widgets
+on the GUI thread. The recycler now offers Manual mode and Automatic proportional diameter control
+for the CL42T puller using these readings. The directioner has separate Manual/Automatic
+spooling controls driven by spooler RPM, without camera input. See the project README for settings,
+command handling, limits and camera-loss behavior. The automatic oscillator
+requires the updated Mega firmware; Nano firmware is unchanged. Depth correction is
+not implemented.
 
 ## Run
 
@@ -15,10 +56,11 @@ For a fresh environment, use Python 3.11 or newer with Tkinter:
     py -3.13 -m venv .venv-camera
     .\.venv-camera\Scripts\python.exe -m pip install -r OV7670Camera\requirements-camera.txt
 
-Click **Detect connected camera** after connecting the Nano with a USB data cable.
-A single recognized Nano/ESP32 USB candidate is opened and queried. Otherwise select
-the appropriate USB port and click **Connect selected port**. Bluetooth ports are
-excluded. The viewer does not flash firmware or enter the bootloader.
+In **Connection**, click **Refresh**, select the Nano USB port, then **Connect**.
+Refresh updates the list without connecting. Port selection and Refresh/Connect/
+Disconnect share one row, matching the recycler interface; baud rate is below.
+The combined launcher still automatically connects a single recognized Nano/ESP32
+USB candidate. Bluetooth ports are excluded. The viewer does not flash firmware or enter the bootloader.
 
 A detected USB port is NOT proof that the camera works. A successful camera
 connection requires the matching identity response, OV7670 PID 0x76, grayscale
@@ -228,7 +270,7 @@ three display pixels thick and are overlaid on the processed preview.
 The Diagnostics Panel below both views displays average pixel widths for Left,
 Middle, and Right, using only valid rows of the latest frame. N/A means no
 valid rows; counts and center coordinates are shown below the boxes. The
-**Instantaneous Mean Diameter [mm]** box is read-only and is calculated when geometry
+**Mean diameter [mm]** box is read-only and is calculated when geometry
 and all three view measurements are valid. It stays blank when these are missing.
 
 The immutable result is available as CameraViewer.processing_result, with the
@@ -337,13 +379,10 @@ session; automatic settings persistence is not implemented.
 
 ### Concise control labels
 
-All Control Panel setup inputs are marked (constant). Only Filament Distance
-and Correction Coefficient are marked (variable). Constants remain editable
-for setup; the labels do not lock the entries or sliders. Mirror Apex Distance
-means the sensor-to-mirror-meeting-point distance. Lens Reference Offset means
-the sensor-to-effective-lens-reference distance. The True Diameter reference is
-constant for each calibration sample. Set Correction is the existing single-press
-coefficient generator, with no change to its behavior.
+Control Panel labels and entries are black, without constant/variable suffixes.
+Mirror Apex Distance means sensor-to-mirror-meeting-point distance. Lens Reference
+Offset means sensor-to-effective-lens-reference distance. Set Calibration generates
+one correction coefficient per press using the True Diameter reference.
 
 Startup values can also be restored using --focal-length, --sensor-width,
 --lens-offset, --filament-distance, --mirror-distance, --correction, and
@@ -352,17 +391,14 @@ Startup values can also be restored using --focal-length, --sensor-width,
 
 ### Collapsible sections
 
-Click the Camera Connection header to hide/show camera selection, USB port,
-and baud rate. Click Control Panel to hide/show all processing and geometry
+Click Connection to hide/show USB port, baud rate and connection buttons. Click Control Panel to hide/show all processing and geometry
 controls. Both sections start expanded; hiding preserves every value and keeps
-capture and processing running. Connection buttons, connection status, frame
-views, and diagnostics stay visible. The Filament Distance and Correction
-Coefficient labels and entered values are red to identify the variable controls.
+capture and processing running. Connection status, frame views and diagnostics stay visible.
 
 
 ## A6 illumination slider (firmware 1.5)
 
-The Control Panel contains LED Brightness - A6 [0-255] (variable), in red.
+The Control Panel contains LED brightness [0-255], shown in black.
 The default is 255 (full brightness, continuous HIGH at approximately 3.3 V).
 Zero is continuous LOW/off. Intermediate
 values control PWM duty at 20 kHz with 8-bit resolution. This adjusts average LED
@@ -453,3 +489,114 @@ Use --left-start/--left-end, --middle-start/--middle-end, and
 --first-x/--second-x/--third-x/--fourth-x options still map shared boundaries
 to the three formerly adjacent windows; explicit start/end options override
 individual coordinates. --light-filament-mode enables inversion at startup.
+
+The camera Control Panel uses black text without constant/variable suffixes.
+Filament Bounds labels the six region sliders. Set Calibration has a live tooltip
+that identifies missing inputs, invalid geometry, missing filament edges or an
+expired camera frame. The Direct View selector, fixed mirror-angle label and
+geometry explanatory paragraphs are hidden; the geometry status note remains.
+Direct-view selection is retained internally (default Middle) so existing saved
+calibrations and operating configurations keep their geometry interpretation.
+
+
+## Transparent Filament mode
+
+Transparent Filament now uses a **filament-free background reference**. The first
+unreferenced rim tracker rejected the observed blurred scene; simply loosening
+it could instead measure an internal reflection. The viewer no longer publishes
+these unverified guesses. The raw preview is unchanged.
+
+1. Set the illumination, camera and mirrors. Remove filament from all three views.
+2. Enable **Transparent Filament** and click **Capture Background**. Keep the
+   filament removed for the full five-second countdown. Every incoming frame is
+   accumulated once; the finished reference is the per-pixel arithmetic mean.
+   Wait for Background ready and its frame count before reinserting filament.
+3. Reinsert filament, keeping the camera, mirrors, background and lighting fixed.
+4. Keep one complete strand in each window, with background outside the windows.
+5. Start with vertical Gradient Window 10-15 and Threshold 4-6. In this mode the
+   threshold is the literal minimum absolute background difference; no automatic
+   exposure compensation or extra noise cutoff changes it.
+6. Check the red outer boundaries against the actual strand, then recalibrate
+   with a known diameter. Do not calibrate against an internal highlight.
+
+Every full-frame pixel satisfying `abs(current - averaged background) > threshold`
+is red in the processed view, including pixels outside the filament windows and
+pixels that are not selected as filament. Equality is not exceeding the threshold.
+The fractional background mean is retained without rounding; the raw preview is
+unchanged. Illumination changes therefore show as deviations too.
+
+Diameter calculation retains clipped vertical averaging and independent bright
+stripe tracking within the three windows, using uncolored image/reference data.
+Changed shadows and scattered reflections are not automatically part of the
+measured stripe. Missing, clipped and ambiguous measurements stay invalid even
+when the preview contains red pixels. The existing geometry/calibration converts
+the three accepted pixel widths to diameter.
+A valid three-view diameter is required before publishing a control reading.
+Light filament inversion changes only preview polarity for this comparison.
+
+References are session-only, deliberately not saved in Operating Configurations:
+a previous physical scene may no longer match. Reconnects, resolution changes,
+LED adjustments and configuration loads clear the reference. Manually recapture
+after any camera/mirror/background movement or external lighting change. Capturing
+with filament still present subtracts that filament too, producing N/A or incorrect
+results. No algorithm can recover a boundary producing no observable contrast.
+
+Validation covers fixed clutter, changed rims, gain/offset compensation, sensor
+noise, missing rows, missing references and reference invalidation. Live accuracy
+still requires a physical filament-free capture and known-diameter check.
+
+
+### Side-view selection correction
+
+The previous reference method spanned the first and last persistent changed
+pixels, which could combine the strand with side-view shadows/reflections. The
+current version tracks one bright changed component independently in each view.
+Components must be brighter than their adjacent flanks; negative and positive
+reference changes are separated before selection. A bright stripe can still be
+accepted when darker than the empty reference: selection uses current local
+brightness, not just the sign of the change. Boundary/width jumps are penalized,
+short missing sections may connect tracks without filling those measurements,
+and similarly strong competing stripes produce N/A. No agreement of widths or
+target diameter is imposed between Left, Middle and Right. Recheck outer-edge
+placement and calibration on the actual setup after updating.
+
+
+### Five-second capture details
+
+Capture is nonblocking, displays remaining time and accumulated frame count, and
+disables its button while active. A separate capture queue retains frames that
+might otherwise be replaced in the latest-preview queue. Only timestamps inside
+the five-second interval count, and duplicate preview deliveries do not count
+twice. A disconnected, stalled or resolution-changing stream cancels capture
+instead of retaining a partial reference. LED changes cancel active captures.
+The frame history must reach within 1.5 s of both window ends and have no gap
+larger than 2 s; at least two unique frames are required.
+
+
+## Yellow polynomial boundaries
+
+In Transparent Filament mode, **Polynomial Fit Order [0-8]** below the mode
+buttons selects the degree of six least-squares curves (default 3). For each
+window and row, the leftmost and rightmost red deviation pixels are samples
+for independent `x(y)` fits. This replaces bright-component selection for the
+GUI's diameter inputs: all red deviations inside that window can affect its
+outer boundary. Restrict windows to the intended filament view.
+
+Yellow curves overlay the red deviation mask. The underlying mask and raw frame
+are unchanged. Per-row pixel width is the fitted right x minus fitted left x,
+using floating-point coordinates before drawing/rounding. The three mean widths
+feed the existing physical geometry and correction coefficient; these fitted
+widths also supply the recycler diameter link. Fit order is saved with viewer
+settings and Operating Configurations; older setups default to 3.
+
+Rows without red pixels are excluded from fitting. At least six, 65% of image
+rows, and degree+1 sample rows are required. Curves are evaluated between the
+first and last observed rows only; internal gaps use the fitted curves, with
+sample counts shown in diagnostics. Crossing, nonfinite or out-of-window fits
+are rejected as N/A, not clipped into a plausible diameter. Reduce the order
+if a fit oscillates. No outlier trimming or target-diameter prior is applied.
+
+Widths now measure distance between the outermost red **pixel centers**, rather
+than the previous changed-pixel interval's inclusive width. For a uniform solid
+band this is one pixel smaller. Recheck the yellow edges and use Set Calibration
+again with known filament before relying on the new diameter values.

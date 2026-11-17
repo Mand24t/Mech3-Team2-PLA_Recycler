@@ -4,3 +4,16 @@ __pycache__/
 *.log
 OV7670Camera/.build-nano/
 OV7670Camera/validation/launcher_check/
+OV7670Camera/viewer_settings.json
+OV7670Camera/viewer_settings.tmp
+recordings/
+.build-mega/
+spooling_settings.json
+spooling_settings.tmp
+
+operating_configurations.json
+operating_configurations.tmp
+OV7670Camera/operating_configuration_request.json
+OV7670Camera/operating_configuration_request.tmp
+OV7670Camera/operating_configuration_result.json
+OV7670Camera/operating_configuration_result.tmp

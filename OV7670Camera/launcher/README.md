@@ -26,3 +26,42 @@ Use the already-open viewer or close the other port owner first. Two Python
 processes for one viewer can be normal: the virtual-environment launcher and
 its actual Python process. The EXE prevents duplicate launches through this
 launcher; starting the Python script directly still creates a separate instance.
+# Combined launcher
+
+`Launch.exe` at the project root opens both GUIs using the existing virtual
+environment and project files. Its source is `ProjectLauncher.cs`. It shares the
+camera launch mutex with `Launch Camera.exe`, and uses a separate recycler mutex
+so rapid clicks restore windows rather than starting duplicate GUI processes.
+The camera attempts USB detection; the recycler waits for explicit connection
+and motor-start actions. Existing windows retain their current state. Launch.exe tiles the recycler on
+the left and camera viewer on the right, each filling half the available work
+area on the monitor containing the mouse pointer. The taskbar remains accessible.
+Launching again restores and repositions existing windows without duplicating them.
+
+Rebuild from the project root in PowerShell:
+
+```powershell
+& "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:winexe /platform:anycpu /optimize+ /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /win32icon:assets\app_icon.ico /out:Launch.exe '.\OV7670Camera\launcher\ProjectLauncher.cs'
+```
+
+
+The combined launcher embeds `assets/app_icon.ico`. Both Python interfaces use
+the same icon for their windows and taskbar buttons. Keep the `assets` folder
+with the project; the original image is stored there unchanged.
+
+To regenerate the ICO from the original PNG, run:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\OV7670Camera\launcher\build_icon.ps1
+```
+
+Then rebuild Launch.exe with the command above. The icon stores lossless RGBA
+PNG frames at 14 sizes, avoiding the damaged transparency produced by the older
+GDI icon conversion and covering common Windows display scales.
+
+Both Python interfaces opt into per-monitor DPI awareness before creating Tk
+windows, matching the launcher. The launcher uses physical monitor work-area
+coordinates and rechecks placement after startup geometry settles. Minimum window
+sizes adapt to smaller displays. After updating this code, fully close both old
+interfaces once before launching again; existing processes retain their old DPI
+mode until restarted. The current application icon remains embedded.
